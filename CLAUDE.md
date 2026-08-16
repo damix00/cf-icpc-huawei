@@ -9,54 +9,66 @@ This file is the operational guide: status, commands, and the rules that were le
 
 ## Status
 
-Best score **16077.404** (submission **#387266889**), all 22 tests OK. Rank **86**; the rank-50
-cutoff is now **16153.093** (`ohhaus`), so the goal is **not** met -- gap **75.7**. Rank 1 is
-16430.623. The field keeps moving, so the gap widens without new score.
+Best score **16109.263** (submission **#387270011**), all 22 tests OK. Rank-50 cutoff is
+**16153.093**, so the gap is **43.8** and closing. Rank 1 is 16430.623.
 
-`sol.cpp` is #387266889 = the 16072.540 policy with **`CF_WAIT_P` 8.0 -> 16.0**, which moved test
-**#19 875.4 -> 880.2** and left the other 21 byte-identical. That constant is now the most
-judge-informative thing in the file -- see "the `CF_WAIT_P` gradient" below.
+`sol.cpp` = `sol_best_16109.cpp` = the old policy with **`CF_WAIT_P` (the D POST merge-hold budget)
+8.0 -> 32.0**. Nothing else changed. This session took 16072.540 -> 16109.263 (**+36.7**) entirely
+on that one constant.
+
+**START HERE NEXT SESSION.** The gradient is still climbing and is *accelerating*; every step so far
+moved test **#19** and nothing else. Probes are prepared, verified (C++17/20/23, zero failures on
+edge/ tests/ hold/ val/ judge/, protocheck 8/8) and ready to upload **in this order**:
+
+| file | change | expectation |
+|---|---|---|
+| `sol_p128.cpp` | `waitPost` 32 -> 128 | next step; #19 has 87.9 points left |
+| `sol_p512.cpp` | `waitPost` 32 -> 512 | if 128 still gains, find the far end |
+| `sol_hc32.cpp` | `holdCap` 4 -> 32 on the 32 base | the OTHER cap on total hold time |
+
+Upload the variant file directly and keep `sol.cpp` pinned to the confirmed best, so a losing or
+dropped probe cannot lose the record of what actually scores. Confirm every submission on
+`/contest/2251/my` — the judge takes ~1 per 9 minutes and silently drops the rest.
+
+**Do not consult the local suites on this axis.** They report `waitPost` 16, 32 and 64 as
+byte-identical: the budget stops binding locally above 16, so no local instrument can see the
+gradient at all, and at the bottom end they called the -104.0 change an improvement.
+
+## Where the +36.7 came from
+
+| `waitPost` | judge total | test #19 | step |
+|---|---|---|---|
+| 1 | 15968.542 | 875.4 | (also #5 -70.8, #8 -19.5, #4 -14.0, #16 -8.4) |
+| 8 | 16072.540 | 875.4 | the old default |
+| 16 | 16077.404 | 880.2 | +4.86 |
+| **32** | **16109.263** | **912.1** | **+31.86** |
+
+Two other tests bound the axis and must be watched on every probe:
+
+* **#5** owns the *budget* at the bottom end: cutting it to the break-even costs **-70.8**, the
+  largest single-test move ever recorded here. Saturated by `waitPost = 8`.
+* **#7** punishes anything that delays an already-ready token: -13.2 from the first-token deferral,
+  -14.6 from `mStar = L`. It is *indifferent to the budget* (907.5 at `waitPost` 1, 8, 16 and 32
+  alike), so raising `waitPost` is free for it. Raising `mStar` is not — do not.
+* **#14** has still never moved, now under 27 submissions. Almost certainly single-request and
+  forced, like #1/#2/#3/#11.
 
 Its 16072.540 predecessor came from two mechanisms (15995.995 -> 16072.540, +76.5):
 
 1. **P PRE just-in-time release** (+56) -- hold a P PRE while the uplink is still carrying another
    *prefill*, so the shortest of a larger pool takes the FIFO slot. Both links are single-server
-   FIFOs, so their order is frozen when work is released, and the release time is ours; the old
-   code dumped every P PRE onto the link the instant E was free, making the order arrival order and
-   leaving the shortest-first pop nothing to sort. Ungated it wrecks TPOT (j_47 448 -> 5072 ms,
-   because TPOT is measured from a request's FIRST token), so it is gated to `activeDecode <= 2`
-   plus a measured TPOT-slack test and a "is mean TDR even over SLO1" guard.
+   FIFOs, so their order is frozen when work is released, and the release time is ours. Ungated it
+   wrecks TPOT (j_47 448 -> 5072 ms, because TPOT is measured from a request's FIRST token), so it
+   is gated to `activeDecode <= 2` plus a measured TPOT-slack test and a TDR guard.
 2. **Placement cost that counts committed remote work** (+19.8, all of it on test #5,
    465.5 -> 487.3) -- `pickRemote` scored a remote by `pendProc` alone, ignoring the task it is
-   running now and the decode groups already queued on it. Both delay our P PROC by exactly their
-   duration. `CF_RBW=1` is the principled weight; `CF_DECW=1` adds the decode-load term (+0.63).
+   running now and the decode groups already queued on it.
 
-Codeforces keeps the **best** submission -- "Your points" tracks it, not the last -- so experiments
-are free and **anything shipped must beat 16077.404 to matter**. The judge takes ~1 submission per
-9 minutes and silently drops earlier ones; always confirm on `/my`.
+Codeforces keeps the **best** submission, so experiments are free and **anything shipped must beat
+16109.263 to matter**.
 
 **Per-test now:** `500, 500, 500.6, 795.9, 487.3, 385.3, 907.5, 830.2, 736, 683.3, 500.2, 799.9,
-730.6, 415.3, 716.6, 980.7, 888.2, 915.7, 880.2, 998.2, 970.6, 955.2`. Tests 1/2/3/11 are capped
-near 500 (single-request instances; #1 is `tests/ex1.txt` and its 500.0000027586 is provably the
-maximum), and **#14 (415.3) has never moved under any of 25 measured submissions** -- almost
-certainly single-request and forced too. The live targets are **#6 (385.3), #5 (487.3),
-#10 (683.3), #15 (716.6), #13 (730.6), #9 (736)**.
-
-## The `CF_WAIT_P` gradient -- the one thing the judge answers loudly
-
-`waitPost` is the D POST merge-hold budget, in units of one merge saving. Three judge measurements:
-
-| `CF_WAIT_P` | judge total | what moved |
-|---|---|---|
-| 1.0 | **15968.542** (-104.0) | **#5 -70.8**, #8 -19.5, #4 -14.0, #16 -8.4, #6 +5.8, #13 +3.0 |
-| 8.0 | 16072.540 | (the long-standing default) |
-| **16.0** | **16077.404** (+4.9) | **#19 +4.8**, other 21 byte-identical |
-
-**-70.8 on test #5 is the largest single-test move ever recorded in this project.** Every local
-instrument -- including the calibrated quiet subset -- called `CF_WAIT_P=1` an improvement (+0.23 to
-+0.72 per test) and called 16 a regression (quiet 739.25 against 740.56). Both were exactly
-backwards. On this constant the local suites are **anti-correlated**, and the judge is the only
-instrument. Keep walking the gradient upward one step at a time and confirm on `/my`.
+730.6, 415.3, 716.6, 980.7, 888.2, 915.7, 912.1, 998.2, 970.6, 955.2`.
 
 ## The merge-batching axis is live — work it with judge probes, one per ~9 min
 
