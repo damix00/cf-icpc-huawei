@@ -936,3 +936,29 @@ That is precisely the conflict `sol_tb.cpp` is built to resolve: budget the merg
 hold shrinks by itself on a test whose TPOT is tight and grows where it is loose. Both terms are
 known online, and `excess_tpot` is clamped at zero, so the slack is free to spend and nothing past
 it is.
+
+### 17d. Session summary of the judge-probe campaign
+
+| # | probe | judge | delta | where |
+|---|---|---|---|---|
+| 387263252 | first-token deferral, gated (`sol_defer.cpp`) | 16049.485 | **-23.06** | #7 -13.2, #13 -10.3, #17 +0.5 |
+| 387266525 | `CF_WAIT_P` 8 -> 1 | 15968.542 | **-104.0** | #5 -70.8, #8 -19.5, #4 -14.0, #16 -8.4 |
+| 387266889 | `CF_WAIT_P` 8 -> 16 | **16077.404** | **+4.86** | #19 +4.86, other 21 identical |
+| 387268195 | `CF_EBW` 1 -> 16 | 16077.404 | 0.000 | nothing; the clamp never binds |
+| 387268716 | `mStar = L` (`sol_mall.cpp`) | 16062.24 | **-15.16** | #7 -14.6 |
+
+Five judge measurements in one session, against 21 in all previous sessions combined. What they
+buy is a map of which of the 22 tests respond to what:
+
+* **#5** -- placement (+19.8 historically) and, far more strongly, the D POST merge-hold *budget*
+  (-70.8 when it is cut to the break-even). Saturated by `waitPost = 8`.
+* **#7** -- punished by anything that delays a token that was already ready: -13.2 from the
+  deferral, -14.6 from `mStar = L`. Indifferent to the budget itself (907.5 at `waitPost` 1, 8 and
+  16 alike). TPOT-critical.
+* **#19** -- the mirror image: +4.86 purely from a *longer* budget at unchanged `mStar`.
+* **#13** -- -10.3 from the deferral, +3.0 from `waitPost = 1`. Sides with #7.
+* **#14** -- still has never moved, now under 26 submissions.
+
+So the axis has two opposing tests and the current setting sits between them. Uniform batching
+cannot win: #19 and #7 want opposite things. The only way to have both is a rule that reads the
+*per-instance* TPOT slack, which is what `sol_tb.cpp` (`CF_TPOTB`) does.
