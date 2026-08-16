@@ -31,6 +31,16 @@ Anything that moves the score from here has to change the *architecture*, not tu
 | `sol_hb` #387284805 | *also* block P POST during the hold | **-3.703** | #4 -1.1, #8 -2.0, #6 -0.4 |
 | `sol_wr128` #387286019 | `waitProc` 14 -> 128 | **0.000** | the D PROC budget never binds at any magnitude |
 | `sol_w8` #387287360 | `warmUp` 100 -> 8 | **0.000** | the only knob positive on BOTH calibrated instruments (quiet +0.63, `judge/` +0.31) — and still nothing |
+| `sol_hpb` #387289015 | remote idles instead of taking prefill during a D PROC hold | **-48.83** | **all of it on #4** — 2nd biggest single-test move ever seen here |
+| `sol_cf` #387290226 | split the prefill to end before the merge member lands | **-17.44** | again **all on #4**: the extra S per piece beats the alignment it buys |
+| `sol_dn` #387290914 | drop the `dStar` widening tie-break when remotes are saturated | **-0.246** | #4 never moved — the gate does not fire there |
+
+**Test #4 is the steepest gradient on the board and sits in a local optimum.** It has 204 points of
+headroom and moves further than any other test under remote-side changes, but all three directions
+tried are downhill (NOTES §20). Whole prefill pieces, no idling, is already right. The single
+untested direction left is `sol_rd.cpp` (`CF_RPRE=0`, let a remote take decode ahead of prefill —
+`prefillUrgent` is always true so it currently never does); built and verified, quiet -0.09,
+loud -4.65.
 
 The two hold results bracket `holdPreToo = 1` from both sides, so the block set is a genuine
 optimum, not a fitted constant. `sol_p512.cpp` and `sol_hc32.cpp` are **dead — do not submit them**;

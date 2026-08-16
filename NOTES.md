@@ -1235,3 +1235,53 @@ Two structural ideas were built and killed against this instance:
 small live population, and transfer-bound with one huge prefill -- the achieved schedule is within a
 few percent of what the instance physically permits, and the residual is head-of-line delay that no
 online policy can avoid.  16109.263 is at or very near this architecture's ceiling.
+
+
+## 20. Test #4 is the steepest gradient on the board, and all three directions are downhill
+
+`sol_hpb.cpp` (submission **387289015**) made a remote skip its P PROC queue when a D PROC merge hold
+had suppressed decode -- the exact fix that was correct on the local computer, where letting E run a
+D PRE during a D POST hold costs 7.9.  On a remote it scored **16060.437, -48.83, every point of it
+on test #4** and all 21 others byte-identical.  That is the second-largest single-test move ever
+recorded here, behind only `CF_WAIT_P=1`'s -70.8 on #5.
+
+So #4's schedule turns on what a remote does during a decode merge hold, and the asymmetry with E is
+real: E's alternative work (P POST, P PRE) is short and productive, while idling a remote is simply
+lost capacity.  Three probes now price #4's remote time and **all three are negative**:
+
+| probe | change on a remote | judge | #4 |
+|---|---|---|---|
+| `sol_hpb` #387289015 | idle rather than take prefill during a D PROC hold | -48.83 | **-48.83** |
+| `sol_cf` #387290226 | split the prefill so the piece ends before the merge member lands | -17.44 | **-17.44** |
+| `CF_WAIT_P=1` #387266525 | shrink the D POST budget to break-even | -104.0 | -14.0 |
+
+`sol_cf.cpp` (`CF_CHFIT`) is worth describing because the idea is sound and the measurement is clean.
+A remote holding both a prefill and a pending decode group had only two options, and hpb priced them
+both; but P PROC is splittable by layers, so a third exists -- run exactly as many layers as fit
+before the predicted merge arrival, keeping the remote busy *and* the decode group on time.  It
+loses 17.4 on #4, i.e. **the extra schedule cost per piece outweighs the merge alignment it buys.**
+Combined with hpb, the reading is unambiguous: on #4 a remote is the scarce resource and every
+avoidable `S` charged to it is charged in full.  Whole pieces, no idling, is already the optimum.
+
+The obvious consequence was tested and does not fire.  `dTol` makes ties for `dStar` go to the
+*wider* remote set, which turns one D PROC task into `d` of them -- exactly the extra `S` #4 is
+punishing.  `sol_dn.cpp` (`CF_DTOLB`/`CF_DTOLS`) drops that widening bias when the remotes are
+saturated.  Gating on `bottleneck() == 0` alone is far too broad (a remote holds the most charged
+work on most instances, so quiet reads **-2.44**, essentially `CF_DTOL=0`); gating on measured
+saturation `max_j busyR[j] / (K * elapsed) > 0.70` is the only setting non-negative on both local
+subsets (quiet +0.07, loud 0.00).  Submitted as **387290914**: **16109.017, -0.246**, and **#4 did
+not move at all** -- the saturation gate never fires there.  The threshold was already a spike rather
+than a plateau (0.85 -> -0.60, 0.70 -> +0.07, 0.50 -> -2.11), so this is rule 4 doing its job.
+
+**Where that leaves #4.** It has 204 points of nominal headroom and the steepest measured gradient of
+any test, but every direction tried is downhill, which is what a local optimum looks like. The one
+thing never measured is the opposite of hpb's mechanism -- letting a remote take *decode* ahead of
+prefill (`prefillUrgent` is always true, so a remote currently defers decode to prefill
+unconditionally).  `sol_rd.cpp` (`CF_RPRE=0`) is built and verified for that and reads quiet -0.09,
+loud -4.65; it is the last untested direction on this axis.
+
+### Running judge tally since 16109.263 — nine probes, nothing positive
+
+`sol_p128` 0.000, `sol_hp0` -7.895, `sol_hb` -3.703, `sol_wr128` 0.000, `sol_w8` 0.000,
+`sol_hpb` -48.83, `sol_cf` -17.44, `sol_dn` -0.246.  Best remains **16109.263 (#387270011)**, rank
+**76**, with the rank-50 cutoff now **16166.452** and rising.
