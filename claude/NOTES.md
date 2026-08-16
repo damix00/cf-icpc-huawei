@@ -1415,3 +1415,41 @@ the selector switched and the prediction was wrong. That is a belief error, not 
 with `CF_TRUTH` the selector has zero losers on every suite. The total token count is now solved
 exactly; what remains uncertain is the per-request *split* of it, so the next step is to average each
 candidate over several sampled splits instead of ranking on one point estimate.
+
+### 21b. Where the remaining gap is, measured: switching, not belief
+
+`CF_TRUTH` separates the two error sources cleanly. Against the per-instance oracle:
+
+| suite | base | selector | selector + TRUE future | oracle | belief gap | switching gap |
+|---|---|---|---|---|---|---|
+| `judge/` | 712.212 | 719.523 | 721.437 | 724.444 | **+1.91** | **+3.01** |
+| `hold/` | 841.165 | 853.185 | 855.351 | 862.215 | **+2.17** | **+6.86** |
+| `val/` | 843.674 | 848.904 | 849.037 | 854.791 | **+0.13** | **+5.75** |
+
+The belief is close to exhausted -- solving the token total from `tp_base` did that. What is left is
+that the oracle applies its theta from t=0 while the selector runs the default until it switches,
+and every millisecond before the switch is lost.
+
+### 21c. The obvious fix for it is judge-negative: -3.164, and one test explains all of it
+
+Firing the selector the instant the belief first becomes good enough (rather than at the next frame
+or token milestone) is worth **+1.78/test on `judge/`**, lifting oracle capture from 60 % to 74 %,
+and it holds up on `hold/` (+11.5) and `tests/` (+5.2).
+
+Submitted as **#387323629: 16112.315, -3.164.** The fingerprint is a single test:
+
+| test | 16115.479 | earlier trigger | delta |
+|---|---|---|---|
+| #6 | 393.217 | 390.053 | **-3.163** |
+| the other 21 | | | **0.000 exactly** |
+
+Two things fall out. First, **the earliest admissible decision is not the best one**: on the only
+test that responds, the extra observation the later trigger buys is worth more than the ramp-up it
+gives away. Reverted (`CF_SELES`, default off). Second, **21 of 22 tests are byte-identical**, which
+also prices the rest of that submission's bundle -- coordinate-descent candidates, candidate dedup,
+the incomplete-round guard and the TPOT-slack candidate are all *exactly* judge-neutral. They are
+kept because they are free on the seen tests and raise `hold/` +12.5 and `judge/` +7.3, and the
+final ranking is on 20 tests nobody has seen.
+
+Running tally of this architecture's judge probes: **+6.216**, **-3.164**. Best **16115.479**
+(#387321232).

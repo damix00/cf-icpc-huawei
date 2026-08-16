@@ -1100,7 +1100,7 @@ struct Selector {
     long long nextTok = 4;
     long long nFrames = 0, nextFrame = 4;
     int rounds = 0;
-    bool arrSel = false, enoughSel = false;
+    bool arrSel = false, enoughSel = false, earlySel = false;
     int nSwitch = 0, maxSwitch = 99;
     bool on = true, dbg = false, predOnly = false;
     clock_t totalBudget = 0, runBudget = 0, spent = 0, wallCeiling = 0;
@@ -1161,6 +1161,7 @@ struct Selector {
         rounds = 0;
         arrSel = false; enoughSel = false; nSwitch = 0;
         maxSwitch = (int)envD("CF_SELMS", 99);
+        earlySel = envD("CF_SELES", 0.0) > 0.5;
         nFrames = 0;
         nextFrame = (long long)envD("CF_SELF", 4);
         spent = 0;
@@ -1179,7 +1180,7 @@ struct Selector {
         bool enough = arrOver || (int)sc.st.size() >= minArr;
         bool trig = false;
         if (arrOver && !arrSel) { arrSel = true; trig = true; }
-        if (enough && !enoughSel) { enoughSel = true; trig = true; }
+        if (earlySel && enough && !enoughSel) { enoughSel = true; trig = true; }
         if (sc.tokensOut >= nextTok) { nextTok *= 4; trig = true; }
         if (++nFrames >= nextFrame) { nextFrame *= 16; trig = true; }
         if (!trig) return;
