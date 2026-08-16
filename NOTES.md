@@ -886,3 +886,28 @@ around there. Remaining probes on the same "more waiting" axis, all verified fai
 and ready to submit: `CF_WAIT_P=32`, `CF_HOLDCAP` 4 -> 8/16 (the cap on total hold time, which
 scales with the same budget), `CF_EBW` 1 -> 4 or unbounded (the ceiling that clamps the budget to a
 single merge saving whenever the local computer is the bottleneck), `CF_WAIT_R` 14 -> 32.
+
+### 17b. The budget is no longer the binding constraint
+
+`sol_ebw.cpp` releases `eBottleW` (the clamp that pins the merge-hold budget to a single merge
+saving whenever the local computer is the bottleneck) from 1.0 to 16.0, i.e. to `waitPost`, making
+it inert. Submitted as **#387268195**: **16077.404 — exactly the current best, unchanged.** The
+clamp never binds on any of the judge's 22 tests. Not promoted (it costs `hold/` -1.0 and `val/`
+-0.5 locally for nothing measurable, and the final test set is frozen, so the special case stays as
+insurance).
+
+Together with `waitPost` 16 and 32 being byte-identical on every local suite, that says the *budget*
+side of the merge hold is now slack. What still caps a decode group is **`mStar`**: the hold only
+fires `while ((int)qDPost.size() < mStar`. So the remaining probes on this axis are the ones that
+raise `mStar` or `holdCap`, not the ones that lengthen the budget:
+
+* `sol_mall.cpp` (`CF_MALL=1`) -- `mStar = max(mStar, L)`, i.e. always target the whole live decode
+  population instead of the rate model's choice. The model's `L/C` term drives `mStar` down because
+  it assumes waves pipeline perfectly; when a single remote serialises D PROC they do not.
+  Locally `judge/` 711.58 vs 712.22, quiet 737.81 vs 739.25 -- both *negative*, which on this axis
+  has twice now meant the opposite on the judge.
+* `holdCap` 4 -> 16, the cap on total hold time.
+* `sol_tb.cpp` (`CF_TPOTB`) -- budget the holds by the *measured TPOT slack* (`SLO2 - tpotNow()`)
+  rather than by a multiple of the merge saving. This is the structural form of what the gradient is
+  paying for: the hold's real cost is the TPOT it spends, the score only charges for the part above
+  SLO2, and both terms are known online.
