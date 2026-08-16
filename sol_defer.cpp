@@ -346,8 +346,32 @@ double jitSlack = 3.0;
 // the same request started later and run through cleanly -- the stall is charged either way, but
 // only in the first case is it inside the measured window.  Requests already producing tokens are
 // never held back: for them the window is open and delay is pure loss.
-int deferFirst = 0;          // 0 off, 1 while a prefill transfer is on a link, 2 while any prefill is unfinished
+int deferFirst = 2;          // 0 off, 1 while a prefill transfer is on a link, 2 while any prefill is unfinished
 double deferSlo = 1.0;       // only defer while a round trip started now would exceed deferSlo*SLO2
+// Deferring buys waiting and pays in throughput, so it is pure loss where waiting carries no
+// weight (h_5_13 has w_c = 0 and loses 88.7).  And it only pays if the congestion actually
+// CLEARS: the whole point is to move a request's measured window past the prefill burst, which is
+// worth nothing when the prefill backlog outlasts the run.  Both are known online -- w_c is given
+// at startup, and the link time still owed to prefill is exactly u times the L_in of every
+// request that has not finished its two transfers yet.
+double deferWc = 0.0;        // require w_c > this to defer at all
+double deferMax = 0.0;       // defer only while the prefill link backlog is under this many SLO2s
+// Holding a first token back is only free while the local computer has something else to run.
+// With nothing else ready the deferral does not move the request's window past the congestion --
+// it idles E, the remote and both links, and the congestion simply lasts longer (g_5_1 -34.5).
+int deferIdle = 0;           // 1 = never defer into an idle local computer
+int deferAct = -1;           // >=0: defer only while at least this many requests already decode
+// A deferral is worth at most the TPOT damage it avoids, which is bounded -- so the wait must be
+// bounded too.  Without a cap a request whose congestion never clears is simply postponed for the
+// whole run, which costs makespan and buys nothing (j_57: tpot 4484 -> 5107, i.e. worse).
+double deferCap = 0.0;       // 0 = uncapped; else a first token may be held at most this many SLO2s
+// With dist_base == 0 the waiting component has no gradient: it is exactly 1.0 while tdr <= SLO1
+// and tpot <= SLO2, and 0 otherwise.  Shaving TPOT below a limit we are already under buys nothing
+// at all there and still costs makespan (ex2, whose requests all have L_out = 1 so TPOT is 0 by
+// construction: 1000.0 -> 933.5).  Only spend throughput on TPOT once TPOT is actually in trouble.
+int deferDB = 0;             // 1 = require dist_base > 0, or a measured TPOT already over SLO2
+vector<double> dpreReady;    // when a request first became ready for its opening D PRE
+double preXferLeft = 0.0;    // ms of link time the arrived-but-unfinished prefills still owe
 
 inline double envD(const char* k, double d) { const char* v = getenv(k); return v ? atof(v) : d; }
 inline const char* envS(const char* k, const char* d) { const char* v = getenv(k); return v ? v : d; }
@@ -357,7 +381,7 @@ inline void ensureReq(int i) {
     size_t n = i + 1;
     st.resize(n, R_DONE); lin_.resize(n, 1); rem.resize(n, 0);
     layersDone.resize(n, 0); chunkStep.resize(n, 1); tokCnt.resize(n, 0);
-    lastTok.resize(n, 0.0);
+    lastTok.resize(n, 0.0); dpreReady.resize(n, -1.0);
     arrT.resize(n, 0.0); procTotal.resize(n, 0.0); tdrCost.resize(n, 0.0); finished.resize(n, 0);
 }
 
@@ -401,11 +425,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -434,8 +454,16 @@ void schedInit(const Params& p, const Table& t) {
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
-    deferFirst = (int)envD("CF_DEFER", 0);
+    deferFirst = (int)envD("CF_DEFER", 2);
     deferSlo = envD("CF_DEFSLO", 1.0);
+    deferWc = envD("CF_DEFWC", 0.0);
+    deferMax = envD("CF_DEFMAX", 0.0);
+    deferIdle = (int)envD("CF_DEFIDLE", 0);
+    deferAct = (int)envD("CF_DEFACT", -1);
+    deferCap = envD("CF_DEFCAP", 0.0);
+    deferDB = (int)envD("CF_DEFDB", 0);
+    dpreReady.clear();
+    preXferLeft = 0.0;
     tokensOut = 0;
 }
 
@@ -625,6 +653,7 @@ inline void onTaskDone(int server) {
         case ST_PPOST: {
             int i = rec.ids[0];
             st[i] = R_NEED_DPRE; qDPre.push_back(i); activeDecode++; decLoad[rem[i]]++;
+            dpreReady[i] = curT;
             preOutstanding--;
             tdrSum += curT - arrT[i]; tdrCnt++;
             outCnt--; outArrSum -= arrT[i]; outCostSum -= tdrCost[i];
@@ -666,6 +695,7 @@ inline void onTransfer(const Event& e, const vector<int>& ids) {
     { auto& q = (e.a == DIR_UP) ? upQ : downQ; if (!q.empty()) q.pop_front(); }
     if (e.b == KIND_PRE) {
         int i = ids[e.off];
+        preXferLeft = max(0.0, preXferLeft - uPerToken * (double)lin_[i]);
         if (e.a == DIR_UP) { st[i] = R_NEED_PPROC; qPProc[rem[i]].push_back(i); }
         else { st[i] = R_NEED_PPOST; qPPost.push_back(i); }
     } else if (e.a == DIR_UP) {
@@ -751,6 +781,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
                 arrCount++; if (firstArr < 0) firstArr = t;
                 planChunks(i);
                 outCnt++; outArrSum += t; outCostSum += tdrCost[i];
+                preXferLeft += 2.0 * uPerToken * (double)lin_[i];
                 qPPre.push_back(i);
                 break;
             }
@@ -819,7 +850,9 @@ void schedFrame(double t, const Frame& f, Response& out) {
     static vector<int> eligDPre;
     eligDPre.clear();
     bool deferring = false;
-    if (deferFirst && P.SLO2 > 0) {
+    if (deferFirst && P.SLO2 > 0 && P.wC > deferWc
+        && (!deferDB || P.distBase > 0 || tpotNow() > P.SLO2)
+        && (deferMax <= 0 || preXferLeft <= deferMax * P.SLO2)) {
         bool preOnLink = (lastPreFin(true) > t) || (lastPreFin(false) > t);
         bool preLeft = (deferFirst >= 2) ? (preOutstanding > 0) : false;
         if (preOnLink || preLeft) {
@@ -831,7 +864,18 @@ void schedFrame(double t, const Frame& f, Response& out) {
             if (round > deferSlo * P.SLO2) deferring = true;
         }
     }
-    for (int i : qDPre) if (!deferring || tokCnt[i] > 0) eligDPre.push_back(i);
+    if (deferring && deferAct >= 0 && activeDecode < deferAct) deferring = false;
+    if (deferring && deferIdle) {
+        bool other = (!qDPost.empty() && !holdPost) || !qPPost.empty()
+                  || (!qPPre.empty() && !holdPPre);
+        bool ownTok = false;
+        for (int i : qDPre) if (tokCnt[i] > 0) { ownTok = true; break; }
+        if (!other && !ownTok) deferring = false;
+    }
+    for (int i : qDPre)
+        if (!deferring || tokCnt[i] > 0
+            || (deferCap > 0 && dpreReady[i] >= 0 && t - dpreReady[i] > deferCap * P.SLO2))
+            eligDPre.push_back(i);
 
     bool dpreFirst = false;
     if (P.wTp > 0 && tokensOut >= swapWarm && curT > t0) {

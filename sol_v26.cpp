@@ -175,6 +175,9 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
 double eBottleW = 1.0;
+double tieEps = 0.0;            // near-ties within tieEps*cMin broken by load, then recency
+double cMin = 1.0;
+vector<double> lastUsed;
 double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
 // Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
 inline int bottleneck() {
@@ -296,7 +299,7 @@ double tdrGuard = 0.5;      // 0 disables the guard
 // All three pass every other gate; only the expected-arrivals test separates them.
 long long arrCount = 0;
 double firstArr = -1;
-double arrExpect = 0.0;     // required expected arrivals inside the window (0 disables)
+double arrExpect = 1.0;     // required expected arrivals inside the window (0 disables)
 inline bool arrivalLikely(double window) {
     if (arrExpect <= 0) return true;
     if (arrCount < 2 || firstArr < 0) return true;      // no rate estimate yet: do not veto
@@ -401,21 +404,14 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    tieEps = envD("CF_TIEE", 0.0);
+    lastUsed.assign(P.K, 0.0);
+    cMin = 3 * P.S + T.c[C_DPRE].at(1.0) + T.c[C_DPROC].at(1.0) + T.c[C_DPOST].at(1.0)
+         + 2 * (P.lat + uPerToken);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -430,7 +426,7 @@ void schedInit(const Params& p, const Table& t) {
     jitL = (int)envD("CF_JITL", 2);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
-    arrExpect = envD("CF_ARRE", 0.0);
+    arrExpect = envD("CF_ARRE", 1.0);
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
@@ -589,7 +585,14 @@ inline int pickRemote() {
         double cost = pendProc[j] + decWeight * decLoad[j];
         if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
                                   + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
-        if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
+        // Ties resolved to the lowest index, which quietly concentrates every equal-cost placement
+        // -- notably every idle remote, all at cost 0 -- onto remote 0.  Break near-ties by how many
+        // requests the remote already carries, then by which was used least recently.
+        double eps = max(1e-9, tieEps * cMin);
+        bool better = cost < bestCost - eps;
+        if (!better && best >= 0 && cost < bestCost + eps)
+            better = (load[j] < load[best]) || (load[j] == load[best] && lastUsed[j] < lastUsed[best]);
+        if (better) { bestCost = min(bestCost, cost); best = j; }
     }
     if (best < 0) {
         best = 0; bestCost = 1e300;
@@ -888,7 +891,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
         } else if (choice == 3) {
             int i = popPPre();
             int j = pickRemote();
-            rem[i] = j; load[j]++;
+            rem[i] = j; load[j]++; lastUsed[j] = t;
             pendProc[j] += procTotal[i] + P.S * ceil((double)P.numLayers / chunkStep[i]);
             Assign& A = newAssign(out, -1, ST_PPRE, j);
             A.ids.push_back(i); st[i] = R_INFL_PPRE; upIns(i);

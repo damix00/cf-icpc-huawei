@@ -401,11 +401,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made

@@ -132,17 +132,19 @@ double curT = 0;
 double upFreeAt = 0, downFreeAt = 0;
 double eFreeAt = 0;              // when the in-flight local task completes
 vector<double> rFreeAt;          // ditto per remote
-struct Xf { double fin; char dec; int remote; };   // remote: which D PROC queue an UP will feed
+// The rollout replays these forward, so each transfer carries the requests it is moving.
+struct Xf { double fin; char dec; int remote; int rid; vector<int> ids; };
 deque<Xf> upQ, downQ;
 
-inline void pushXfer(bool up, double len, bool dec, int remote) {
+inline void pushXfer(bool up, double len, bool dec, int remote, const vector<int>& xids,
+                     int rid = -1) {
     double& freeAt = up ? upFreeAt : downFreeAt;
     double start = max(curT, freeAt);
     double d = P.lat + uPerToken * len;
     (up ? busyUp : busyDn) += d;
     if (!dec) { if (up) preUp += d; else preDn += d; }
     freeAt = start + d;
-    (up ? upQ : downQ).push_back({freeAt, (char)dec, remote});
+    (up ? upQ : downQ).push_back({freeAt, (char)dec, remote, rid, xids});
 }
 // When does the next decode transfer that would feed this queue land?  +inf if none is queued.
 // An UP transfer only grows qDProc[remote] for its own remote, so the filter matters when K > 1.
@@ -174,23 +176,6 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // schedule cost S on a computer, one latency on the link.  When the link is the bottleneck and
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
-double eBottleW = 1.0;
-double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
-// Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
-inline int bottleneck() {
-    double r = 0;
-    for (int j = 0; j < P.K; j++) r = max(r, busyR[j]);
-    double link = max(busyUp, busyDn);
-    if (busyE >= r && busyE >= link) return -1;
-    return link >= r ? 1 : 0;
-}
-// Holding a task back to merge it with the next one removes one fixed cost (a schedule cost S on a
-// computer, one latency on a link) from that resource.  But the wait itself only costs nothing
-// while the resource we are holding has something else to do -- if it is the bottleneck and it
-// idles, the wait is charged against the whole schedule.  So the budget has to depend on whether
-// the local computer is the bottleneck: generous when it is not, one merge-saving when it is.
-inline double waitBudget(double base) { return bottleneck() == -1 ? min(base, eBottleW) : base; }
-
 inline bool batchingHelpsBottleneck(double m) {
     double r = 0;
     for (int j = 0; j < P.K; j++) r = max(r, busyR[j]);
@@ -262,57 +247,6 @@ vector<double> lastTok;
 inline double tpotNow() { return gapCnt ? spanSum / (double)gapCnt : 0.0; }
 double tpotMargin = 0.75;  // 0 disables the measured gate and leaves the jitL threshold alone
 
-// ---- is mean TDR actually costing us anything? ----------------------------------------------
-// Reordering the uplink buys mean TDR and pays in TPOT.  excess_tdr is clamped at zero, so while
-// the projected mean TDR sits under SLO1 the trade buys nothing at all -- and it is never free.
-// j_64 is the case in miniature: dist_base is 0.164, its natural tdr is 3708 against SLO1 = 6263
-// (excess zero, waiting component already a perfect 1.0), and reordering pushes tpot from 48.8 to
-// 86.7 past SLO2 = 65.0.  dist goes from 0 to 0.334, over dist_base, and the whole 500-point
-// waiting component vanishes for a throughput gain of 0.006.  Same shape as the swapMin rule in
-// section 8: never spend a component that is already maxed out.
-//
-// The projection has to be forward-looking, because the reordering fires during ramp-up when
-// almost nothing has completed yet.  Completed requests contribute their realised TDR; requests
-// still in the input stage contribute at least the time they have already waited and at least
-// their uncontended path cost.
-double tdrSum = 0;          // realised, summed at P POST
-long long tdrCnt = 0;
-double outArrSum = 0, outCostSum = 0;
-long long outCnt = 0;
-double tdrGuard = 0.5;      // 0 disables the guard
-
-// ---- will waiting actually change the order? ------------------------------------------------
-// Holding a P PRE cannot reorder what is already queued: the shortest-first pop already picks the
-// shortest, and the local computer dispatches far faster than the uplink drains, so two queued
-// requests end up in the FIFO shortest-first whether we hold or not.  The only thing a hold can
-// buy is the chance that something SHORTER ARRIVES while the link is busy.  So it is worth taking
-// exactly when an arrival is likely inside the window, and it is pure loss when it is not --
-// which is measurable, because the arrival rate so far is observable:
-//
-//   j_53  hold on: tdr 29040 -> 11310, tpot 1280 -> 2956   -> +66.7, reordering really happened
-//   j_60  hold on: tdr 91970 -> 92090, tpot 1512 -> 2712   -> -80.2, nothing to reorder
-//   j_50  hold on: tdr unchanged,      tpot 7657 -> 35770  -> -198,  nothing to reorder
-//
-// All three pass every other gate; only the expected-arrivals test separates them.
-long long arrCount = 0;
-double firstArr = -1;
-double arrExpect = 0.0;     // required expected arrivals inside the window (0 disables)
-inline bool arrivalLikely(double window) {
-    if (arrExpect <= 0) return true;
-    if (arrCount < 2 || firstArr < 0) return true;      // no rate estimate yet: do not veto
-    double span = curT - firstArr;
-    if (span <= 0) return true;
-    double lam = (double)(arrCount - 1) / span;
-    return lam * window >= arrExpect;
-}
-inline bool tdrWorthIt() {
-    if (tdrGuard <= 0) return true;
-    long long cnt = tdrCnt + outCnt;
-    if (cnt == 0) return true;
-    double sum = tdrSum + max((double)outCnt * curT - outArrSum, outCostSum);
-    return sum > tdrGuard * P.SLO1 * (double)cnt;
-}
-
 // ---- just-in-time release to the two FIFO links -----------------------------------------
 // Both links are single-server FIFOs, so the order of work on them is frozen the moment we
 // release it -- and the release time is ours to choose.  Starting a prefill while the link is
@@ -336,8 +270,8 @@ inline bool tdrWorthIt() {
 // during ramp-up almost no TPOT window is open yet, so the reordering is free.  Offline hill
 // climbing over per-frame decisions picks exactly these frames and nothing else.
 int jitPre = 1, jitProc = 3, jitMode = 1;
-int jitL = 2;                // hold P PRE only while at most this many requests are decoding
-double jitSlack = 3.0;
+int jitL = 1;                // hold P PRE only while at most this many requests are decoding
+double jitSlack = 1.0;
 
 // ---- do not open a request's TPOT window into a congested link ---------------------------
 // TPOT is (last token - first token)/(L_out-1) per request: the clock starts at the FIRST token
@@ -361,6 +295,216 @@ inline void ensureReq(int i) {
     arrT.resize(n, 0.0); procTotal.resize(n, 0.0); tdrCost.resize(n, 0.0); finished.resize(n, 0);
 }
 
+// ---- exact forward rollout ------------------------------------------------------------------
+// Every hold in this file is a guess dressed as a budget: "wait if the next member lands within
+// waitX * mergeSaving".  Offline hill climbing over per-frame decisions beats those budgets by
+// 8-40 points a test, and the frames it picks cannot be separated from the frames it rejects by
+// any feature the budgets use -- the blanket version of the very same delay is uniformly worse.
+// So the decision needs the model rather than a proxy for it: the interactor is deterministic and
+// every duration is known up front, so from the current state we can simulate both futures and
+// look at which one is ahead.
+//
+// Unknown are future arrivals (assumed none) and L_out (assumed unbounded, so requests keep
+// cycling).  Both assumptions apply identically to the two branches being compared, so they bias
+// the absolute numbers and not the comparison.  The horizon is a few decode round trips: long
+// enough for a merge to pay for itself, short enough to afford.
+namespace Roll {
+
+int rollOn = 0;
+int horizonEv = 96;
+double horizonRt = 3.0;
+double wPost = 1.0;
+int robj = 0;              // 0 = tokens in a fixed window, 1 = realised rate, 2 = time to N tokens
+double tokTarget = 24;
+long long budgetUsed = 0, budgetCap = 0, rollCalls = 0, rollMax = 0;
+clock_t startClk = 0;
+double clkCap = 6.0;
+
+// Rolling out is affordable only because the judge leaves ~35x of the time limit unused, and a
+// TLE scores zero on the test.  So the budget is capped three ways: simulated events, decisions
+// rolled out, and a hard wall on measured CPU time well inside the limit.
+inline bool affordable() {
+    if (!rollOn || budgetUsed >= budgetCap || rollCalls >= rollMax) return false;
+    if ((rollCalls & 63) == 0 && (double)(clock() - startClk) / CLOCKS_PER_SEC > clkCap) return false;
+    return true;
+}
+
+struct St {
+    vector<int> stt, rm, lay;
+    vector<char> rbusy;
+    vector<double> rfree;
+    char ebusy = 0;
+    double efree = 0, upFree = 0, dnFree = 0, t = 0;
+    int eStep = -1;
+    vector<int> eIds;
+    vector<int> rStep, rLe;
+    vector<vector<int>> rIds;
+    deque<int> qPre, qPost;
+    vector<int> qDPre, qDPost;
+    vector<deque<int>> qProc;
+    vector<vector<int>> qDProc;
+    deque<Xf> up, dn;
+    long long tokens = 0, posts = 0;
+};
+
+St SA, SB;
+
+void capture(St& s) {
+    s.stt = st; s.rm = rem; s.lay = layersDone;
+    s.rbusy = rBusy; s.rfree = rFreeAt;
+    s.ebusy = (char)eBusy; s.efree = eFreeAt;
+    s.upFree = upFreeAt; s.dnFree = downFreeAt; s.t = curT;
+    s.eStep = eBusy ? eRec.step : -1;
+    s.eIds = eBusy ? eRec.ids : vector<int>();
+    s.rStep.assign(P.K, -1); s.rLe.assign(P.K, 0); s.rIds.assign(P.K, vector<int>());
+    for (int j = 0; j < P.K; j++)
+        if (rBusy[j]) { s.rStep[j] = rRec[j].step; s.rLe[j] = rRec[j].le; s.rIds[j] = rRec[j].ids; }
+    s.qPre = qPPre; s.qPost = qPPost; s.qDPre = qDPre; s.qDPost = qDPost;
+    s.qProc = qPProc; s.qDProc = qDProc;
+    s.up = upQ; s.dn = downQ;
+    s.tokens = 0; s.posts = 0;
+}
+
+inline double durOf(int step, const vector<int>& ids, int ls, int le) {
+    switch (step) {
+        case ST_PPRE:  return T.c[C_PPRE].at(lin_[ids[0]]);
+        case ST_PPROC: return (double)(le - ls) / P.numLayers * T.c[C_PPROC].at(lin_[ids[0]]);
+        case ST_PPOST: return T.c[C_PPOST].at(lin_[ids[0]]);
+        case ST_DPRE:  return T.c[C_DPRE].at((double)ids.size());
+        case ST_DPROC: return T.c[C_DPROC].at((double)ids.size());
+        default:       return T.c[C_DPOST].at((double)ids.size());
+    }
+}
+
+inline void push(St& s, bool up, double len, bool dec, int remote, const vector<int>& ids, int rid) {
+    double& f = up ? s.upFree : s.dnFree;
+    double start = max(s.t, f);
+    f = start + P.lat + uPerToken * len;
+    (up ? s.up : s.dn).push_back({f, (char)dec, remote, rid, ids});
+}
+
+void finishTask(St& s, int srv) {
+    int step = srv < 0 ? s.eStep : s.rStep[srv];
+    static vector<int> ids;
+    ids = srv < 0 ? s.eIds : s.rIds[srv];
+    if (srv < 0) { s.ebusy = 0; s.eStep = -1; s.eIds.clear(); }
+    else { s.rbusy[srv] = 0; s.rStep[srv] = -1; s.rIds[srv].clear(); }
+    if (ids.empty()) return;
+    switch (step) {
+        case ST_PPRE:
+            s.stt[ids[0]] = R_WAIT_PRE_UP;
+            push(s, true, lin_[ids[0]], false, s.rm[ids[0]], ids, ids[0]);
+            break;
+        case ST_PPROC: {
+            int i = ids[0];
+            s.lay[i] = s.rLe[srv < 0 ? 0 : srv];
+            if (s.lay[i] >= P.numLayers) { s.stt[i] = R_WAIT_PRE_DOWN; push(s, false, lin_[i], false, s.rm[i], ids, i); }
+            else { s.stt[i] = R_NEED_PPROC; s.qProc[s.rm[i]].push_back(i); }
+            break;
+        }
+        case ST_PPOST: s.stt[ids[0]] = R_NEED_DPRE; s.qDPre.push_back(ids[0]); s.posts++; break;
+        case ST_DPRE: {
+            static vector<int> mem;
+            for (int i : ids) s.stt[i] = R_WAIT_DEC_UP;
+            for (int j = 0; j < P.K; j++) {
+                mem.clear();
+                for (int i : ids) if (s.rm[i] == j) mem.push_back(i);
+                if (!mem.empty()) push(s, true, (double)mem.size(), true, j, mem, -1);
+            }
+            break;
+        }
+        case ST_DPROC:
+            for (int i : ids) s.stt[i] = R_WAIT_DEC_DOWN;
+            push(s, false, (double)ids.size(), true, srv, ids, -1);
+            break;
+        case ST_DPOST:
+            s.tokens += (long long)ids.size();
+            for (int i : ids) { s.stt[i] = R_NEED_DPRE; s.qDPre.push_back(i); }
+            break;
+    }
+}
+
+void finishXfer(St& s, bool up) {
+    Xf x = up ? s.up.front() : s.dn.front();
+    (up ? s.up : s.dn).pop_front();
+    if (!x.dec) {
+        int i = x.rid;
+        if (i < 0) return;
+        if (up) { s.stt[i] = R_NEED_PPROC; s.qProc[s.rm[i]].push_back(i); }
+        else    { s.stt[i] = R_NEED_PPOST; s.qPost.push_back(i); }
+    } else if (up) {
+        for (int i : x.ids) { s.stt[i] = R_NEED_DPROC; s.qDProc[s.rm[i]].push_back(i); }
+    } else {
+        for (int i : x.ids) { s.stt[i] = R_NEED_DPOST; s.qDPost.push_back(i); }
+    }
+}
+
+// Base policy inside the rollout: never hold, take everything ready, prefill first.  It is the
+// yardstick both branches are measured against, and its merging behaviour is exactly what makes
+// "wait one event" show up as a gain when it really is one.
+void policy(St& s) {
+    if (!s.ebusy) {
+        int step = -1;
+        if (!s.qPost.empty()) step = ST_PPOST;
+        else if (!s.qPre.empty()) step = ST_PPRE;
+        else if (!s.qDPost.empty()) step = ST_DPOST;
+        else if (!s.qDPre.empty()) step = ST_DPRE;
+        if (step == ST_PPOST) { s.eIds.assign(1, s.qPost.front()); s.qPost.pop_front(); }
+        else if (step == ST_PPRE) { s.eIds.assign(1, s.qPre.front()); s.qPre.pop_front(); }
+        else if (step == ST_DPOST) { s.eIds = s.qDPost; s.qDPost.clear(); }
+        else if (step == ST_DPRE) { s.eIds = s.qDPre; s.qDPre.clear(); }
+        if (step >= 0) {
+            s.eStep = step; s.ebusy = 1;
+            s.efree = s.t + P.S + durOf(step, s.eIds, 0, P.numLayers);
+        }
+    }
+    for (int j = 0; j < P.K; j++) {
+        if (s.rbusy[j]) continue;
+        if (!s.qProc[j].empty()) {
+            int i = s.qProc[j].front(); s.qProc[j].pop_front();
+            s.rIds[j].assign(1, i); s.rStep[j] = ST_PPROC; s.rLe[j] = P.numLayers;
+            s.rbusy[j] = 1;
+            s.rfree[j] = s.t + P.S + durOf(ST_PPROC, s.rIds[j], s.lay[i], P.numLayers);
+        } else if (!s.qDProc[j].empty()) {
+            s.rIds[j] = s.qDProc[j]; s.qDProc[j].clear();
+            s.rStep[j] = ST_DPROC; s.rbusy[j] = 1;
+            s.rfree[j] = s.t + P.S + durOf(ST_DPROC, s.rIds[j], 0, 0);
+        }
+    }
+}
+
+double run(St& s) {
+    double rt = 3 * P.S + T.c[C_DPRE].at(1) + T.c[C_DPROC].at(1) + T.c[C_DPOST].at(1)
+              + 2 * (P.lat + uPerToken);
+    double tEnd = s.t + horizonRt * rt;
+    double t0 = s.t;
+    for (int ev = 0; ev < horizonEv; ev++) {
+        if (robj == 2 && (double)s.tokens >= tokTarget) break;
+        double nxt = 1e300;
+        if (s.ebusy) nxt = min(nxt, s.efree);
+        for (int j = 0; j < P.K; j++) if (s.rbusy[j]) nxt = min(nxt, s.rfree[j]);
+        if (!s.up.empty()) nxt = min(nxt, s.up.front().fin);
+        if (!s.dn.empty()) nxt = min(nxt, s.dn.front().fin);
+        if (nxt > 1e299 || nxt > tEnd) break;
+        s.t = nxt;
+        if (s.ebusy && s.efree <= nxt + 1e-12) finishTask(s, -1);
+        for (int j = 0; j < P.K; j++) if (s.rbusy[j] && s.rfree[j] <= nxt + 1e-12) finishTask(s, j);
+        while (!s.up.empty() && s.up.front().fin <= nxt + 1e-12) finishXfer(s, true);
+        while (!s.dn.empty() && s.dn.front().fin <= nxt + 1e-12) finishXfer(s, false);
+        policy(s);
+        budgetUsed++;
+    }
+    double dt = max(1e-9, s.t - t0);
+    // A fixed window rewards whichever branch happens to have work queued; comparing realised
+    // rates instead asks the question that actually matters -- which future produces tokens (and
+    // clears prefills, where TDR's clock stops) faster per millisecond.
+    if (robj == 1) return ((double)s.tokens + wPost * (double)s.posts) / dt;
+    if (robj == 2) return -dt + wPost * (double)s.posts;
+    return (double)s.tokens + wPost * (double)s.posts;
+}
+
+}  // namespace Roll
+
 void schedInit(const Params& p, const Table& t) {
     P = p; T = t;
     qPProc.assign(P.K, {});
@@ -372,7 +516,7 @@ void schedInit(const Params& p, const Table& t) {
     pendProc.assign(P.K, 0.0);
     // marginal remote cost of carrying one more decoding request, times a nominal remaining Lout
     double slope = max(0.0, (T.c[C_DPROC].at(64.0) - T.c[C_DPROC].at(1.0)) / 63.0);
-    decWeight = envD("CF_DECW", 1.0) * slope;
+    decWeight = envD("CF_DECW", 0.0) * slope;
     uPerToken = 8.0 * P.bytesPerToken / (P.bw * 1e6);
     sjf = envD("CF_SJF", 1.0) > 0.5;
     sjfProc = (int)envD("CF_SJFP", 1);
@@ -401,21 +545,8 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
-    eBottleW = envD("CF_EBW", 1.0);
-    remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -425,14 +556,20 @@ void schedInit(const Params& p, const Table& t) {
     swapWarm = (int)envD("CF_SWAPW", 8);
     jitPre = (int)envD("CF_JITP", 1);
     jitProc = (int)envD("CF_JITR", 3);
-    jitSlack = envD("CF_JITS", 3.0);
+    jitSlack = envD("CF_JITS", 1.0);
     jitMode = (int)envD("CF_JITM", 1);
-    jitL = (int)envD("CF_JITL", 2);
+    jitL = (int)envD("CF_JITL", 1);
+    Roll::rollOn = (int)envD("CF_ROLL", 0);
+    Roll::horizonEv = (int)envD("CF_RH", 96);
+    Roll::horizonRt = envD("CF_RRT", 3.0);
+    Roll::wPost = envD("CF_RWP", 1.0);
+    Roll::robj = (int)envD("CF_ROBJ", 0);
+    Roll::tokTarget = envD("CF_RTOK", 24);
+    Roll::budgetCap = (long long)envD("CF_RCAP", 3e7);
+    Roll::rollMax = (long long)envD("CF_RMAX", 20000);
+    Roll::clkCap = envD("CF_RCLK", 6.0);
+    Roll::budgetUsed = 0; Roll::rollCalls = 0; Roll::startClk = clock();
     tpotMargin = envD("CF_TPOTM", 0.75);
-    tdrGuard = envD("CF_TDRG", 0.5);
-    arrExpect = envD("CF_ARRE", 0.0);
-    arrCount = 0; firstArr = -1;
-    tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
     deferFirst = (int)envD("CF_DEFER", 0);
     deferSlo = envD("CF_DEFSLO", 1.0);
@@ -583,19 +720,13 @@ inline int pickRemote() {
         // Widening the decode set costs one more transfer latency per wave in each direction;
         // dStar is where the model says that stops paying for itself.
         if (load[j] == 0 && active >= dStar) continue;
-        // Placement decides when this request reaches P PROC, and pendProc alone ignores two
-        // things the remote is already committed to: the task it is running now, and the decode
-        // groups already queued on it.  Both delay our P PROC by exactly their duration.
         double cost = pendProc[j] + decWeight * decLoad[j];
-        if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
-                                  + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
         if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
     }
     if (best < 0) {
         best = 0; bestCost = 1e300;
         for (int j = 0; j < P.K; j++) {
             double cost = pendProc[j] + decWeight * decLoad[j];
-            if (remBusyW > 0) cost += remBusyW * max(0.0, rFreeAt[j] - curT);
             if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
         }
     }
@@ -610,7 +741,7 @@ inline void onTaskDone(int server) {
             int i = rec.ids[0];
             st[i] = R_WAIT_PRE_UP;
             pendingTransfers++;
-            pushXfer(true, lin_[i], false, rem[i]);
+            pushXfer(true, lin_[i], false, rem[i], rec.ids, i);
             break;
         }
         case ST_PPROC: {
@@ -618,7 +749,7 @@ inline void onTaskDone(int server) {
             pendProc[rem[i]] = max(0.0, pendProc[rem[i]]
                                  - (double)(rec.le - rec.ls) / P.numLayers * procTotal[i] - P.S);
             layersDone[i] = rec.le;
-            if (rec.le >= P.numLayers) { st[i] = R_WAIT_PRE_DOWN; pendingTransfers++; pushXfer(false, lin_[i], false, rem[i]); }
+            if (rec.le >= P.numLayers) { st[i] = R_WAIT_PRE_DOWN; pendingTransfers++; pushXfer(false, lin_[i], false, rem[i], rec.ids, i); }
             else { st[i] = R_NEED_PPROC; qPProc[rem[i]].push_back(i); }
             break;
         }
@@ -626,8 +757,6 @@ inline void onTaskDone(int server) {
             int i = rec.ids[0];
             st[i] = R_NEED_DPRE; qDPre.push_back(i); activeDecode++; decLoad[rem[i]]++;
             preOutstanding--;
-            tdrSum += curT - arrT[i]; tdrCnt++;
-            outCnt--; outArrSum -= arrT[i]; outCostSum -= tdrCost[i];
             break;
         }
         case ST_DPRE: {
@@ -637,13 +766,18 @@ inline void onTaskDone(int server) {
             for (int i : rec.ids) { st[i] = R_WAIT_DEC_UP; if (!cnt[rem[i]]++) distinct++; }
             pendingTransfers += distinct;
             // one UP per distinct remote, entering the queue in increasing remote index
-            for (int j = 0; j < P.K; j++) if (cnt[j]) pushXfer(true, cnt[j], true, j);
+            static vector<int> mem;
+            for (int j = 0; j < P.K; j++) if (cnt[j]) {
+                mem.clear();
+                for (int i : rec.ids) if (rem[i] == j) mem.push_back(i);
+                pushXfer(true, cnt[j], true, j, mem);
+            }
             break;
         }
         case ST_DPROC: {
             for (int i : rec.ids) st[i] = R_WAIT_DEC_DOWN;
             pendingTransfers++;
-            pushXfer(false, (double)rec.ids.size(), true, server);
+            pushXfer(false, (double)rec.ids.size(), true, server, rec.ids);
             break;
         }
         case ST_DPOST: {
@@ -748,9 +882,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
                 ensureReq(i);
                 lin_[i] = e.b; arrT[i] = t; layersDone[i] = 0; finished[i] = 0; tokCnt[i] = 0;
                 st[i] = R_NEED_PPRE; preOutstanding++;
-                arrCount++; if (firstArr < 0) firstArr = t;
                 planChunks(i);
-                outCnt++; outArrSum += t; outCostSum += tdrCost[i];
                 qPPre.push_back(i);
                 break;
             }
@@ -782,7 +914,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
     bool holdPost = false;
     if (inFlight && !qDPost.empty() && (int)qDPost.size() < mStar && batchingHelpsBottleneck(mStar)) {
         double t1 = min(nextDecAt(false, -1), nextDownAfterProc());
-        double budget = waitBudget(waitPost) * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
+        double budget = waitPost * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
         if (holdPostSince < 0) holdPostSince = t;
         if (t1 - t <= budget && t - holdPostSince <= holdCap * budget) holdPost = true;
     }
@@ -793,12 +925,10 @@ void schedFrame(double t, const Frame& f, Response& out) {
     // early.  Hold, and let the queue grow into something worth sorting.
     bool holdPPre = false;
     bool tpotRoom = tpotMargin > 0 && P.SLO2 > 0 && gapCnt > 0 && tpotNow() < tpotMargin * P.SLO2;
-    if (jitPre && (activeDecode <= jitL || tpotRoom) && tdrWorthIt()
-        && !qPPre.empty() && pendingTransfers > 0) {
+    if (jitPre && (activeDecode <= jitL || tpotRoom) && !qPPre.empty() && pendingTransfers > 0) {
         int i = peekPPre();
         double lim = jitMode ? lastPreFin(true) : upFreeAt;
-        if (lim > t + jitSlack * (P.S + T.c[C_PPRE].at(lin_[i])) && arrivalLikely(lim - t))
-            holdPPre = true;
+        if (lim > t + jitSlack * (P.S + T.c[C_PPRE].at(lin_[i]))) holdPPre = true;
     }
 
     // Same argument on the downlink, where the release valve is the LAST P PROC piece: it is
@@ -856,6 +986,36 @@ void schedFrame(double t, const Frame& f, Response& out) {
             if ((c == 0 && !qDPost.empty() && !holdPost) || (c == 1 && !qPPost.empty()) ||
                 (c == 2 && !eligDPre.empty() && !(holdPost && holdPreToo)) ||
                 (c == 3 && !qPPre.empty() && !holdPPre)) choice = c;
+        }
+        // Act now, or wait one event?  Simulate both futures with the exact model and compare.
+        if (Roll::affordable() && choice >= 0 && inFlight) {
+            static vector<int> rids;
+            int rstep = -1, rrem = -1;
+            rids.clear();
+            if (choice == 0) { rstep = ST_DPOST; rids = qDPost; }
+            else if (choice == 1) { rstep = ST_PPOST; rids.assign(1, qPPost.front()); }
+            else if (choice == 2) { rstep = ST_DPRE; rids = eligDPre; }
+            else { rstep = ST_PPRE; rids.assign(1, peekPPre()); rrem = pickRemote(); }
+            Roll::rollCalls++;
+            Roll::capture(Roll::SA);
+            if (rstep == ST_PPRE) Roll::SA.rm[rids[0]] = rrem;
+            Roll::SA.eIds = rids; Roll::SA.eStep = rstep; Roll::SA.ebusy = 1;
+            Roll::SA.efree = t + P.S + Roll::durOf(rstep, rids, 0, P.numLayers);
+            if (rstep == ST_DPOST) Roll::SA.qDPost.clear();
+            else if (rstep == ST_DPRE) {
+                auto& q = Roll::SA.qDPre;
+                for (int id : rids) q.erase(remove(q.begin(), q.end(), id), q.end());
+            } else if (rstep == ST_PPOST) {
+                auto& q = Roll::SA.qPost;
+                for (size_t k = 0; k < q.size(); k++) if (q[k] == rids[0]) { q.erase(q.begin() + k); break; }
+            } else {
+                auto& q = Roll::SA.qPre;
+                for (size_t k = 0; k < q.size(); k++) if (q[k] == rids[0]) { q.erase(q.begin() + k); break; }
+            }
+            double ja = Roll::run(Roll::SA);
+            Roll::capture(Roll::SB);
+            double jb = Roll::run(Roll::SB);
+            if (jb > ja + 1e-9) choice = -1;      // waiting genuinely wins
         }
         if (choice == 0) {
             Assign& A = newAssign(out, -1, ST_DPOST, -1);

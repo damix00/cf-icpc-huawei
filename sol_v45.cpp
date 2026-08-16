@@ -175,6 +175,7 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
 double eBottleW = 1.0;
+double idxW = 0.0;   // price the increasing-remote-index transfer order into placement
 double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
 // Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
 inline int bottleneck() {
@@ -401,21 +402,11 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    idxW = envD("CF_IDXW", 0.0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -589,6 +580,17 @@ inline int pickRemote() {
         double cost = pendProc[j] + decWeight * decLoad[j];
         if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
                                   + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
+        // A D PRE's per-remote transfers enter the uplink in INCREASING REMOTE INDEX (statement,
+        // D PRE), so a request on remote j waits behind the transfer of every lower-index remote in
+        // its wave -- not once, but on every decode round for the rest of its life.  Nothing else
+        // here sees that asymmetry, and it is the same shape as the committed-work omission: a real,
+        // systematic delay missing from the cost.  Weighted per round; idxW scales it against the
+        // one-off prefill delays the rest of the cost measures.
+        if (idxW > 0) {
+            int lower = 0;
+            for (int k = 0; k < j; k++) if (load[k] > 0) lower++;
+            cost += idxW * (double)lower * (P.lat + uPerToken * max(1.0, (double)mStarR));
+        }
         if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
     }
     if (best < 0) {

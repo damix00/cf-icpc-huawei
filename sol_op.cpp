@@ -175,7 +175,8 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
 double eBottleW = 1.0;
-double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
+double openW = 0.0;      // 0 = off: dStar keeps its hard veto over opening a fresh remote
+double remBusyW = 1.0;// weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
 // Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
 inline int bottleneck() {
     double r = 0;
@@ -401,13 +402,10 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
+    openW = envD("CF_OPEN", 0.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
     // before the link predictor could see across the remote stage.  With the full look-ahead in
     // place the budget is what limits how many decode members a remote can gather, and 4x cuts
@@ -574,21 +572,41 @@ inline int peekPProc(int j) {
 
 // Balance by projected remote work, not request count: prefill_proc varies by orders of
 // magnitude with Lin, so counting requests leaves remotes badly skewed.
+inline double remoteCost(int j) {
+    // Placement decides when this request reaches P PROC, and pendProc alone ignores two
+    // things the remote is already committed to: the task it is running now, and the decode
+    // groups already queued on it.  Both delay our P PROC by exactly their duration.
+    double cost = pendProc[j] + decWeight * decLoad[j];
+    if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
+                              + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
+    return cost;
+}
+
 inline int pickRemote() {
     int active = 0;
     for (int j = 0; j < P.K; j++) if (load[j] > 0) active++;
+    // `dStar` answers "how many remotes should one decode WAVE span?", and it is a pure throughput
+    // number: a wave touching d remotes emits d uplink transfers, so it prices spreading at one
+    // extra `lat` per decode round in each direction.  Using it as a hard cap on PLACEMENT throws
+    // away the other half of the trade -- every request placed on an already-loaded remote waits
+    // behind that remote's whole committed prefill queue before its own P PROC can start, which
+    // delays it into the decode loop and starves the links of decode work.  On j_48 (K=6) the cap
+    // is dStar=1 and all 54 requests land on two remotes while four sit idle for the entire run.
+    // Price the two against each other instead of letting one veto the other: opening a fresh
+    // remote is worth it exactly when the best open remote's committed work exceeds what the extra
+    // per-round latency costs.
+    double openPrice = 1e300;
+    if (openW > 0)
+        openPrice = openW * (3 * P.S + T.c[C_DPRE].at(1.0) + T.c[C_DPROC].at(1.0)
+                             + T.c[C_DPOST].at(1.0) + 2 * (P.lat + uPerToken));
+    double bestOpen = 1e300;
+    for (int j = 0; j < P.K; j++) if (load[j] > 0) bestOpen = min(bestOpen, remoteCost(j));
+    bool mayOpen = bestOpen > openPrice;
     int best = -1;
     double bestCost = 1e300;
     for (int j = 0; j < P.K; j++) {
-        // Widening the decode set costs one more transfer latency per wave in each direction;
-        // dStar is where the model says that stops paying for itself.
-        if (load[j] == 0 && active >= dStar) continue;
-        // Placement decides when this request reaches P PROC, and pendProc alone ignores two
-        // things the remote is already committed to: the task it is running now, and the decode
-        // groups already queued on it.  Both delay our P PROC by exactly their duration.
-        double cost = pendProc[j] + decWeight * decLoad[j];
-        if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
-                                  + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
+        if (load[j] == 0 && active >= dStar && !mayOpen) continue;
+        double cost = remoteCost(j);
         if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
     }
     if (best < 0) {

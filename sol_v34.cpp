@@ -175,6 +175,8 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
 double eBottleW = 1.0;
+double transitW = 0.0;   // scale decode interference by how long our prefill is still in transit
+double cMin = 1.0;
 double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
 // Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
 inline int bottleneck() {
@@ -401,21 +403,13 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    transitW = envD("CF_TRW", 0.0);
+    cMin = 3 * P.S + T.c[C_DPRE].at(1.0) + T.c[C_DPROC].at(1.0) + T.c[C_DPOST].at(1.0)
+         + 2 * (P.lat + uPerToken);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -574,7 +568,11 @@ inline int peekPProc(int j) {
 
 // Balance by projected remote work, not request count: prefill_proc varies by orders of
 // magnitude with Lin, so counting requests leaves remotes badly skewed.
-inline int pickRemote() {
+// The request being placed is known, so the window before its prefill actually lands on a remote
+// is known too: the uplink backlog plus its own transfer.  Decode interference is not a constant --
+// a remote carrying d decoding requests will run about one D PROC per round trip for each of them
+// during that whole window, so the interference our P PROC will meet scales with the window.
+inline int pickRemote(int placeLin) {
     int active = 0;
     for (int j = 0; j < P.K; j++) if (load[j] > 0) active++;
     int best = -1;
@@ -587,6 +585,10 @@ inline int pickRemote() {
         // things the remote is already committed to: the task it is running now, and the decode
         // groups already queued on it.  Both delay our P PROC by exactly their duration.
         double cost = pendProc[j] + decWeight * decLoad[j];
+        if (transitW > 0 && cMin > 0) {
+            double transit = max(0.0, upFreeAt - curT) + P.lat + uPerToken * (double)placeLin;
+            cost += transitW * (double)decLoad[j] * (P.S + T.c[C_DPROC].at(1.0)) * (transit / cMin);
+        }
         if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
                                   + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
         if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
@@ -887,7 +889,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
             recordBusy(eRec, A); eBusy = true;
         } else if (choice == 3) {
             int i = popPPre();
-            int j = pickRemote();
+            int j = pickRemote(lin_[i]);
             rem[i] = j; load[j]++;
             pendProc[j] += procTotal[i] + P.S * ceil((double)P.numLayers / chunkStep[i]);
             Assign& A = newAssign(out, -1, ST_PPRE, j);

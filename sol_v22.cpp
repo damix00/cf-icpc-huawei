@@ -175,7 +175,20 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
 double eBottleW = 1.0;
-double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
+double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request
+// dStar answers "how many remotes should one decode WAVE span?" -- a wave spanning d remotes emits
+// d uplink transfers, so on a high-latency instance the model rightly returns 1.  Using that same
+// number as a hard cap on PLACEMENT is a different claim, and a wrong one: a wave whose members all
+// live on remote j still emits exactly one transfer, so refusing an idle remote buys nothing.  Left
+// coupled, every request lands on remote 0 while the others idle for the whole run (h_4_15:
+// rem=0.945,0,0,0,0 over 141 s against a work floor of 26.6 s).  Open a fresh remote once the
+// prefill already committed to the best open one exceeds a decode round trip -- but only when the
+// instance is short of REMOTE time rather than LINK time.  arrPProc/arrPXfer are totalled from Lin
+// at arrival, so unlike the busy* accumulators they do not depend on the placement they are being
+// used to decide (gating on those makes the rule chase its own tail).
+double openThresh = 16.0, openLink = 1.0;   // 0 disables: keep dStar as the hard placement cap
+double cMin = 1.0;
+double arrPProc = 0, arrPXfer = 0;   // hold-budget ceiling while the local computer is the bottleneck
 // Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
 inline int bottleneck() {
     double r = 0;
@@ -296,7 +309,7 @@ double tdrGuard = 0.5;      // 0 disables the guard
 // All three pass every other gate; only the expected-arrivals test separates them.
 long long arrCount = 0;
 double firstArr = -1;
-double arrExpect = 0.0;     // required expected arrivals inside the window (0 disables)
+double arrExpect = 1.0;     // required expected arrivals inside the window (0 disables)
 inline bool arrivalLikely(double window) {
     if (arrExpect <= 0) return true;
     if (arrCount < 2 || firstArr < 0) return true;      // no rate estimate yet: do not veto
@@ -372,7 +385,7 @@ void schedInit(const Params& p, const Table& t) {
     pendProc.assign(P.K, 0.0);
     // marginal remote cost of carrying one more decoding request, times a nominal remaining Lout
     double slope = max(0.0, (T.c[C_DPROC].at(64.0) - T.c[C_DPROC].at(1.0)) / 63.0);
-    decWeight = envD("CF_DECW", 1.0) * slope;
+    decWeight = envD("CF_DECW", 0.0) * slope;
     uPerToken = 8.0 * P.bytesPerToken / (P.bw * 1e6);
     sjf = envD("CF_SJF", 1.0) > 0.5;
     sjfProc = (int)envD("CF_SJFP", 1);
@@ -401,21 +414,15 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    openThresh = envD("CF_OPEN", 16.0);
+    openLink = envD("CF_OPENL", 1.0);
+    arrPProc = arrPXfer = 0;
+    cMin = 3 * P.S + T.c[C_DPRE].at(1.0) + T.c[C_DPROC].at(1.0) + T.c[C_DPOST].at(1.0)
+         + 2 * (P.lat + uPerToken);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -430,7 +437,7 @@ void schedInit(const Params& p, const Table& t) {
     jitL = (int)envD("CF_JITL", 2);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
-    arrExpect = envD("CF_ARRE", 0.0);
+    arrExpect = envD("CF_ARRE", 1.0);
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
@@ -521,6 +528,8 @@ inline void planChunks(int i) {
     // whole uncontended arrival -> P POST path; used to order admissions shortest-first
     tdrCost[i] = 3 * P.S + T.c[C_PPRE].at(L) + pp + T.c[C_PPOST].at(L)
                + 2 * (P.lat + uPerToken * L);
+    arrPProc += pp;                                  // remote prefill compute this instance owes
+    arrPXfer += P.lat + uPerToken * L;               // prefill link time it owes, one direction
     int c = (int)llround(pp / pieceTargetMs);
     c = max(1, min(P.numLayers, c));
     chunkStep[i] = max(1, (P.numLayers + c - 1) / c);
@@ -579,10 +588,14 @@ inline int pickRemote() {
     for (int j = 0; j < P.K; j++) if (load[j] > 0) active++;
     int best = -1;
     double bestCost = 1e300;
+    double bestOpen = 1e300;
+    for (int j = 0; j < P.K; j++)
+        if (load[j] > 0) bestOpen = min(bestOpen, pendProc[j] + decWeight * decLoad[j]);
+    bool remoteBound = arrPProc / P.K > openLink * arrPXfer;
+    bool allowNew = (active < dStar)
+                 || (openThresh > 0 && remoteBound && bestOpen > openThresh * cMin);
     for (int j = 0; j < P.K; j++) {
-        // Widening the decode set costs one more transfer latency per wave in each direction;
-        // dStar is where the model says that stops paying for itself.
-        if (load[j] == 0 && active >= dStar) continue;
+        if (load[j] == 0 && !allowNew) continue;
         // Placement decides when this request reaches P PROC, and pendProc alone ignores two
         // things the remote is already committed to: the task it is running now, and the decode
         // groups already queued on it.  Both delay our P PROC by exactly their duration.

@@ -228,6 +228,7 @@ const char* ordDecode = "0213";
 // resource independently caps the rate.  Larger m amortises S and lat but lengthens C, so the
 // best m is a genuine trade-off that depends on the instance -- which is why a fixed policy
 // (always take everything ready, as the greedy version does) is wrong in both directions.
+int fixM = 0, fixD = 0, fixMR = 0;   // diagnostic overrides for the wave-shape oracle
 int mStar = 1;        // target D PRE / D POST group size
 int mStarR = 1;       // target D PROC group size on one remote
 int dStar = 1;        // remotes worth spreading a decode wave across
@@ -401,11 +402,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -416,6 +413,7 @@ void schedInit(const Params& p, const Table& t) {
     // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
     // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
     waitProc = envD("CF_WAIT_R", 14.0);
+    fixM = (int)envD("CF_FIXM", 0); fixD = (int)envD("CF_FIXD", 0); fixMR = (int)envD("CF_FIXMR", 0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -509,7 +507,10 @@ inline void retarget() {
         // at once, which is what keeps a saturated link fed.
         if (rd > bestD * (1 - dTol)) { bestD = max(bestD, rd); dStar = d; }
     }
+    if (fixM > 0) mStar = max(1, min(fixM, L));
+    if (fixD > 0) dStar = max(1, min(fixD, P.K));
     mStarR = max(1, mStar / dStar);
+    if (fixMR > 0) mStarR = fixMR;
 
 }
 

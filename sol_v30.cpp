@@ -175,6 +175,7 @@ inline double mergeSaving(const PLCurve& c, double q, double S) {
 // its time is nearly all payload (u*m >> lat), a bigger group moves exactly the same bytes and
 // buys nothing -- while still lengthening every request's round trip.  Batching then is pure loss.
 double eBottleW = 1.0;
+int qLookahead = 0;   // count decode groups queued on a busy remote as future downlink arrivals
 double remBusyW = 1.0;   // weight on a remote's already-committed work when placing a request   // hold-budget ceiling while the local computer is the bottleneck
 // Which resource is the bottleneck right now: -1 = local computer, 0 = a remote, 1 = a link.
 inline int bottleneck() {
@@ -296,7 +297,7 @@ double tdrGuard = 0.5;      // 0 disables the guard
 // All three pass every other gate; only the expected-arrivals test separates them.
 long long arrCount = 0;
 double firstArr = -1;
-double arrExpect = 0.0;     // required expected arrivals inside the window (0 disables)
+double arrExpect = 1.0;     // required expected arrivals inside the window (0 disables)
 inline bool arrivalLikely(double window) {
     if (arrExpect <= 0) return true;
     if (arrCount < 2 || firstArr < 0) return true;      // no rate estimate yet: do not veto
@@ -401,21 +402,11 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    qLookahead = (int)envD("CF_QLA", 0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -430,7 +421,7 @@ void schedInit(const Params& p, const Table& t) {
     jitL = (int)envD("CF_JITL", 2);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
-    arrExpect = envD("CF_ARRE", 0.0);
+    arrExpect = envD("CF_ARRE", 1.0);
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
@@ -679,9 +670,16 @@ inline void onTransfer(const Event& e, const vector<int>& ids) {
 inline double nextDownAfterProc() {
     double best = 1e300;
     for (int j = 0; j < P.K; j++) {
-        if (!rBusy[j] || rRec[j].step != ST_DPROC) continue;
-        double fin = max(rFreeAt[j], downFreeAt) + P.lat + uPerToken * (double)rRec[j].ids.size();
-        best = min(best, fin);
+        if (rBusy[j] && rRec[j].step == ST_DPROC) {
+            double fin = max(rFreeAt[j], downFreeAt) + P.lat + uPerToken * (double)rRec[j].ids.size();
+            best = min(best, fin);
+        } else if (qLookahead > 0 && !qDProc[j].empty()) {
+            // A decode group merely QUEUED on a busy remote still lands, just later.  Ignoring it
+            // makes the D POST hold think nothing more is coming and fire a short wave -- the same
+            // blind spot that made the placement cost ignore committed remote work.
+            double done = max(curT, rFreeAt[j]) + P.S + T.c[C_DPROC].at((double)qDProc[j].size());
+            best = min(best, max(done, downFreeAt) + P.lat + uPerToken * (double)qDProc[j].size());
+        }
     }
     return best;
 }

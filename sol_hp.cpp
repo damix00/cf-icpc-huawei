@@ -335,6 +335,15 @@ inline bool tdrWorthIt() {
 // explodes -- 448 -> 5072 ms on j_47.  The two effects separate cleanly by decode population:
 // during ramp-up almost no TPOT window is open yet, so the reordering is free.  Offline hill
 // climbing over per-frame decisions picks exactly these frames and nothing else.
+// ---- offline PLACEMENT search harness (diagnostic; sol_hp only) ------------------------------
+// The oracle bound in NOTES 14 only ever overrode the local computer's per-frame choice, and it
+// closed that family.  This hook overrides the OTHER half of the same decision: which remote a
+// P PRE is placed on.  CF_HPLIST names a file of "dispatchIndex remote" pairs; dispatch index is
+// the n-th call to pickRemote(), i.e. the n-th request admitted, so the whole search space is
+// R * K and can be swept exhaustively rather than sampled.
+map<long long, int> hpMap;
+long long hpIdx = 0;
+
 int jitPre = 1, jitProc = 3, jitMode = 1;
 int jitL = 2;                // hold P PRE only while at most this many requests are decoding
 double jitSlack = 3.0;
@@ -401,11 +410,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -434,6 +439,11 @@ void schedInit(const Params& p, const Table& t) {
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
+    hpMap.clear(); hpIdx = 0;
+    if (const char* fn = getenv("CF_HPLIST")) {
+        FILE* fp = fopen(fn, "r");
+        if (fp) { long long f; int c; while (fscanf(fp, "%lld %d", &f, &c) == 2) hpMap[f] = c; fclose(fp); }
+    }
     deferFirst = (int)envD("CF_DEFER", 0);
     deferSlo = envD("CF_DEFSLO", 1.0);
     tokensOut = 0;
@@ -575,6 +585,9 @@ inline int peekPProc(int j) {
 // Balance by projected remote work, not request count: prefill_proc varies by orders of
 // magnitude with Lin, so counting requests leaves remotes badly skewed.
 inline int pickRemote() {
+    long long myIdx = hpIdx++;
+    int hpWant = -1;
+    { auto it = hpMap.find(myIdx); if (it != hpMap.end() && it->second >= 0 && it->second < P.K) hpWant = it->second; }
     int active = 0;
     for (int j = 0; j < P.K; j++) if (load[j] > 0) active++;
     int best = -1;
@@ -598,6 +611,22 @@ inline int pickRemote() {
             if (remBusyW > 0) cost += remBusyW * max(0.0, rFreeAt[j] - curT);
             if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
         }
+    }
+    if (hpWant >= 0) {
+        if (getenv("CF_HPTRACE")) {
+            fprintf(stderr, "PLACE n=%lld t=%.3f was=%d now=%d K=%d dStar=%d active=%d L=%d "
+                            "pend=[", myIdx, curT, best, hpWant, P.K, dStar, active, activeDecode);
+            for (int j = 0; j < P.K; j++)
+                fprintf(stderr, "%s%.2f/%d/%d", j ? "," : "", pendProc[j], load[j], decLoad[j]);
+            fprintf(stderr, "] rfree=[");
+            for (int j = 0; j < P.K; j++)
+                fprintf(stderr, "%s%.2f", j ? "," : "", max(0.0, rFreeAt[j] - curT));
+            fprintf(stderr, "] qdproc=[");
+            for (int j = 0; j < P.K; j++)
+                fprintf(stderr, "%s%d", j ? "," : "", (int)qDProc[j].size());
+            fprintf(stderr, "]\n");
+        }
+        best = hpWant;
     }
     return best;
 }

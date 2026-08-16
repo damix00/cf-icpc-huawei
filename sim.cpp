@@ -98,6 +98,14 @@ string failMsg;
 
 // utilisation / batching statistics
 double busyE = 0, busyUp = 0, busyDown = 0;
+// link idle accounting: every moment a link had nothing queued is a moment the makespan floor
+// (which is exactly the link work on the saturated instances) is being missed by.
+struct LinkGap { double s, e; int dir, kind; };
+vector<LinkGap> linkGaps;
+// the same accounting for the computers: srv = -1 is E, else the remote index
+struct SrvGap { double s, e; int srv, step; };
+vector<SrvGap> srvGaps;
+vector<double> srvFreeAt;
 vector<double> busyR;
 double grpSum[6] = {0, 0, 0, 0, 0, 0};
 long long grpCnt[6] = {0, 0, 0, 0, 0, 0};
@@ -127,6 +135,7 @@ inline void pushEv(double t, int kind, int idx) {
 // queue a transfer onto its FIFO link at time q
 inline void queueXfer(double q, int dir, int remote, int kind, double len, const vector<int>& ids) {
     double& linkFree = (dir == DIR_UP) ? upFree : downFree;
+    if (q > linkFree + 1e-9) linkGaps.push_back({linkFree, q, dir, kind});
     double start = max(q, linkFree);
     double fin = start + xferTime(len);
     linkFree = fin;
@@ -218,6 +227,9 @@ bool startTask(double t, const Assign& A, vector<char>& usedServer) {
     }
 
     usedServer[slot] = 1;
+    if ((int)srvFreeAt.size() > slot && t > srvFreeAt[slot] + 1e-9)
+        srvGaps.push_back({srvFreeAt[slot], t, srv, A.step});
+    if ((int)srvFreeAt.size() > slot) srvFreeAt[slot] = t + P.S + stepDur(A.step, A.ids, ls, le);
     if (srv < 0) eBusy = true; else rBusy[srv] = 1;
 
     Task tk;
@@ -439,7 +451,8 @@ Result run(const TestCase& t_, bool verb, FILE* script) {
     qTdr.assign(tc.R, 0.0); qFirstTok.assign(tc.R, 0.0); qLastTok.assign(tc.R, 0.0);
     rBusy.assign(P.K, 0);
     eBusy = false; upFree = downFree = 0; finishedCount = 0; failed = false; failMsg.clear();
-    tasks.clear(); xfers.clear(); seqCtr = 0;
+    tasks.clear(); xfers.clear(); linkGaps.clear(); srvGaps.clear(); seqCtr = 0;
+    srvFreeAt.assign(P.K + 1, 0.0);
     busyE = busyUp = busyDown = 0; busyR.assign(P.K, 0.0);
     for (int i = 0; i < 6; i++) { grpSum[i] = 0; grpCnt[i] = 0; }
     refCur = -1; refPtr = 0;
@@ -670,6 +683,49 @@ int main(int argc, char** argv) {
                Sim::grpCnt[ST_DPROC] ? Sim::grpSum[ST_DPROC] / Sim::grpCnt[ST_DPROC] : 0.0, Sim::grpCnt[ST_DPROC],
                Sim::grpCnt[ST_DPOST] ? Sim::grpSum[ST_DPOST] / Sim::grpCnt[ST_DPOST] : 0.0, Sim::grpCnt[ST_DPOST],
                Sim::grpCnt[ST_PPROC], tc.R);
+        // Where the link idled.  On a link-bound instance tp_UB is exactly the saturated-link rate,
+        // so every idle millisecond here is score.
+        {
+            double t0 = tc.arr[0];
+            double tot[2] = {0, 0}, byKind[2][2] = {{0, 0}, {0, 0}};
+            for (auto& g : Sim::linkGaps) {
+                if (g.s < t0) g.s = t0;
+                if (g.e <= g.s) continue;
+                tot[g.dir] += g.e - g.s; byKind[g.dir][g.kind] += g.e - g.s;
+            }
+            printf("   link idle: up=%.4g (%.1f%%) [pre-next %.4g, dec-next %.4g]  down=%.4g (%.1f%%)"
+                   " [pre-next %.4g, dec-next %.4g]  gaps=%d\n",
+                   tot[0], 100 * tot[0] / e, byKind[0][0], byKind[0][1],
+                   tot[1], 100 * tot[1] / e, byKind[1][0], byKind[1][1], (int)Sim::linkGaps.size());
+            vector<Sim::LinkGap> g2 = Sim::linkGaps;
+            sort(g2.begin(), g2.end(), [](const Sim::LinkGap& a, const Sim::LinkGap& b) {
+                return a.e - a.s > b.e - b.s; });
+            double t0s = tc.arr[0];
+            vector<double> sidle(tc.P.K + 1, 0.0);
+            static const char* stn[6] = {"Ppre","Pproc","Ppost","Dpre","Dproc","Dpost"};
+            vector<vector<double>> byStep(tc.P.K + 1, vector<double>(6, 0.0));
+            for (auto g : Sim::srvGaps) {
+                if (g.s < t0s) g.s = t0s;
+                if (g.e <= g.s) continue;
+                int sl = g.srv + 1;
+                sidle[sl] += g.e - g.s; byStep[sl][g.step] += g.e - g.s;
+            }
+            printf("   server idle: E=%.1f%%", 100 * sidle[0] / e);
+            for (int j = 0; j < tc.P.K; j++) printf(" C%d=%.1f%%", j, 100 * sidle[j + 1] / e);
+            printf("\n   idle ended by:");
+            for (int sl = 0; sl <= tc.P.K; sl++) {
+                if (sidle[sl] < 0.02 * e) continue;
+                printf(" %s[", sl ? (string("C") + to_string(sl - 1)).c_str() : "E");
+                for (int z = 0; z < 6; z++)
+                    if (byStep[sl][z] > 0.005 * e) printf("%s=%.0f%%", stn[z], 100 * byStep[sl][z] / e);
+                printf("]");
+            }
+            printf("\n   biggest gaps:");
+            for (int z = 0; z < (int)g2.size() && z < 8; z++)
+                printf(" %s%s[%.4g..%.4g]=%.4g", g2[z].dir ? "DN" : "UP", g2[z].kind ? "d" : "p",
+                       g2[z].s, g2[z].e, g2[z].e - g2[z].s);
+            printf("\n");
+        }
     }
     return 0;
 }

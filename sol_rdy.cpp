@@ -156,8 +156,8 @@ inline double nextDecAt(bool up, int remote) {
 // is still a known future event: we know when that task ends and how big its transfer will be.
 // Without this the D POST hold can only see transfers already in the queue, so it never waits
 // across the remote stage -- exactly the merge that matters when several remotes are decoding.
-inline double nextDownAfterProc();
-inline double nextUpAfterPre(int remote);
+inline double nextDownAfterProc(int mode);
+inline double nextUpAfterPre(int remote, int mode);
 
 // What one merge actually saves on a resource: one schedule cost plus the task's fixed term,
 // estimated from the curve itself (2*f(q) - f(2q) is the intercept of an affine f).
@@ -339,6 +339,27 @@ int jitPre = 1, jitProc = 3, jitMode = 1;
 int jitL = 2;                // hold P PRE only while at most this many requests are decoding
 double jitSlack = 3.0;
 
+// ---- the merge look-ahead must see READY work, not only RUNNING work --------------------
+// "Should I wait for one more group member?" is answered by nextDownAfterProc / nextUpAfterPre,
+// which scan for a task already in flight that will deliver one.  Both were extended once already
+// -- from "a transfer is queued" to "a task is running that will queue one" -- but they still stop
+// one step short: a task that is READY and will be dispatched by this very frame is invisible to
+// them, because the hold is decided BEFORE the remote loop and the local dispatch run.
+//
+// That blind spot lands on exactly the frame that matters.  When a decode UP transfer completes,
+// qDProc[j] becomes non-empty on an idle remote; rBusy[j] is still last frame's 0, so
+// nextDownAfterProc returns +inf, the D POST hold sees "nothing else is coming", and E burns a
+// whole S on a one-member D POST -- moments before the D PROC it should have waited for lands.
+// The member arrival is not a guess: the remote loop below dispatches it in this same frame.
+int rdyLook = 3;             // bit 0: ready D PROC feeds the D POST hold; bit 1: ready D PRE feeds
+                             //         the D PROC hold.  0 restores the old running-only scan.
+// Ready work is certain but further away than running work, so it has to clear a stricter test.
+// A merge saves exactly one schedule cost plus the task's fixed term; any wait longer than that
+// is a net loss on the resource doing the waiting.  The 8x/4x multipliers on the running-work
+// budget were fitted when the look-ahead could only see one stage back, and reusing them here
+// admits waits that cost more than the merge returns.
+double rdyW = 1.0;
+
 // ---- do not open a request's TPOT window into a congested link ---------------------------
 // TPOT is (last token - first token)/(L_out-1) per request: the clock starts at the FIRST token
 // and nothing before it is measured, while TDR has already stopped at P POST.  So a request that
@@ -401,21 +422,10 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -428,6 +438,8 @@ void schedInit(const Params& p, const Table& t) {
     jitSlack = envD("CF_JITS", 3.0);
     jitMode = (int)envD("CF_JITM", 1);
     jitL = (int)envD("CF_JITL", 2);
+    rdyLook = (int)envD("CF_RDY", 3);
+    rdyW = envD("CF_RDYW", 1.0);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
     arrExpect = envD("CF_ARRE", 0.0);
@@ -676,22 +688,48 @@ inline void onTransfer(const Event& e, const vector<int>& ids) {
 }
 
 // earliest moment a D PROC still on a remote could deliver its results to qDPost
-inline double nextDownAfterProc() {
+inline double nextDownAfterProc(int mode) {
     double best = 1e300;
     for (int j = 0; j < P.K; j++) {
-        if (!rBusy[j] || rRec[j].step != ST_DPROC) continue;
-        double fin = max(rFreeAt[j], downFreeAt) + P.lat + uPerToken * (double)rRec[j].ids.size();
-        best = min(best, fin);
+        double n, ready;
+        if ((mode & 2) && rBusy[j] && rRec[j].step == ST_DPROC) {
+            n = (double)rRec[j].ids.size();
+            ready = rFreeAt[j];
+        } else if ((mode & 1) && !qDProc[j].empty()) {
+            // Ready, not yet dispatched -- the remote loop below will take it this frame (or as
+            // soon as it is free), so it is every bit as certain as one already running.
+            n = (double)qDProc[j].size();
+            ready = max(curT, rFreeAt[j]);
+            // ...except that prefill unconditionally preempts decode on a remote, so a queued
+            // P PROC piece genuinely goes first and pushes the delivery out by its duration.
+            if (!qPProc[j].empty()) {
+                int i = peekPProc(j);
+                int stepSz = decLoad[j] > 0 ? chunkStep[i] : P.numLayers;
+                int le = min(P.numLayers, layersDone[i] + stepSz);
+                ready += P.S + (double)(le - layersDone[i]) / P.numLayers * procTotal[i];
+            }
+            ready += P.S + T.c[C_DPROC].at(n);
+        } else continue;
+        best = min(best, max(ready, downFreeAt) + P.lat + uPerToken * n);
     }
     return best;
 }
 // earliest moment a D PRE still on the local computer could deliver members to qDProc[remote]
-inline double nextUpAfterPre(int remote) {
-    if (!eBusy || eRec.step != ST_DPRE) return 1e300;
+inline double nextUpAfterPre(int remote, int mode) {
     int cnt = 0;
-    for (int i : eRec.ids) if (rem[i] == remote) cnt++;
+    double ready;
+    if ((mode & 2) && eBusy && eRec.step == ST_DPRE) {
+        for (int i : eRec.ids) if (rem[i] == remote) cnt++;
+        ready = eFreeAt;
+    } else if (mode & 1) {
+        // Same blind spot on the uplink side: members sitting in qDPre are dispatched by the local
+        // block below, but the remote's hold is decided before that runs.
+        for (int i : qDPre) if (rem[i] == remote) cnt++;
+        if (!cnt) return 1e300;
+        ready = max(curT, eFreeAt) + P.S + T.c[C_DPRE].at((double)qDPre.size());
+    } else return 1e300;
     if (!cnt) return 1e300;
-    return max(eFreeAt, upFreeAt) + P.lat + uPerToken * cnt;
+    return max(ready, upFreeAt) + P.lat + uPerToken * cnt;
 }
 
 inline Assign& newAssign(Response& out, int server, int step, int remote) {
@@ -781,10 +819,12 @@ void schedFrame(double t, const Frame& f, Response& out) {
     // the next arrival is closer than the work we would otherwise be doing.
     bool holdPost = false;
     if (inFlight && !qDPost.empty() && (int)qDPost.size() < mStar && batchingHelpsBottleneck(mStar)) {
-        double t1 = min(nextDecAt(false, -1), nextDownAfterProc());
-        double budget = waitBudget(waitPost) * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
+        double sav = mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
+        double budget = waitBudget(waitPost) * sav;
+        bool near = (min(nextDecAt(false, -1), nextDownAfterProc(2)) - t <= budget);
+        if (!near && (rdyLook & 1)) near = (nextDownAfterProc(1) - t <= rdyW * sav);
         if (holdPostSince < 0) holdPostSince = t;
-        if (t1 - t <= budget && t - holdPostSince <= holdCap * budget) holdPost = true;
+        if (near && t - holdPostSince <= holdCap * budget) holdPost = true;
     }
     if (!holdPost) holdPostSince = -1;
 
@@ -902,10 +942,12 @@ void schedFrame(double t, const Frame& f, Response& out) {
         bool doDecode = !qDProc[j].empty();
         // same trade-off on the remote: a bigger D PROC costs one S instead of two
         if (doDecode && inFlight && (int)qDProc[j].size() < mStarR && batchingHelpsBottleneck(mStarR)) {
-            double t1 = min(nextDecAt(true, j), nextUpAfterPre(j));
-            double budget = waitProc * mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
+            double sav = mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
+            double budget = waitProc * sav;
+            bool near = (min(nextDecAt(true, j), nextUpAfterPre(j, 2)) - t <= budget);
+            if (!near && (rdyLook & 2)) near = (nextUpAfterPre(j, 1) - t <= rdyW * sav);
             if (holdProcSince[j] < 0) holdProcSince[j] = t;
-            if (t1 - t <= budget && t - holdProcSince[j] <= holdCap * budget) doDecode = false;
+            if (near && t - holdProcSince[j] <= holdCap * budget) doDecode = false;
             else holdProcSince[j] = -1;
         } else holdProcSince[j] = -1;
         if (doDecode && prefillUrgent && !qPProc[j].empty()) doDecode = false;

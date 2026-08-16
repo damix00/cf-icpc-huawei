@@ -236,6 +236,7 @@ double holdPostSince = -1;
 vector<double> holdProcSince;
 double waitPost = 8.0, waitProc = 4.0, holdCap = 4.0, warmUp = 100.0, dTol = 0.04;
 int holdPreToo = 1;
+int ddir = 0;   // 1 = only break dStar ties toward wider when the remotes are the busiest resource
 // D PRE vs D POST on the local computer.  D PRE hands work DOWNSTREAM (the uplink, then a remote);
 // D POST only refills a queue E already owns.  Running D PRE first therefore keeps the pipeline fed
 // -- worth +3.9 across 21 of the judge's 22 tests (submission 387157181).  On the 22nd it cost
@@ -401,25 +402,15 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
     holdPreToo = (int)envD("CF_HOLDPRE", 1);
+    ddir = (int)envD("CF_DDIR", 0);
     holdCap = envD("CF_HOLDCAP", 4.0);
     swapMin = envD("CF_SWAP", 0.05);
     swapWarm = (int)envD("CF_SWAPW", 8);
@@ -507,7 +498,19 @@ inline void retarget() {
         // Within the tolerance the model cannot really distinguish the options, and extra
         // remotes buy pipeline depth it does not represent: more waves can sit in D PROC
         // at once, which is what keeps a saturated link fed.
-        if (rd > bestD * (1 - dTol)) { bestD = max(bestD, rd); dStar = d; }
+        // Ties went to the WIDER set unconditionally, on the grounds that extra remotes buy
+        // pipeline depth the model does not represent.  But widening a wave costs one transfer
+        // latency per remote per round in each direction, which is precisely what a latency-bound
+        // instance cannot afford -- so only prefer wider when remote time is the scarce resource.
+        bool preferWide = true;
+        if (ddir) {
+            double rmax = 0;
+            for (int q = 0; q < P.K; q++) rmax = max(rmax, busyR[q]);
+            preferWide = rmax >= max(busyE, max(busyUp, busyDn));
+        }
+        if (preferWide ? (rd > bestD * (1 - dTol)) : (rd > bestD * (1 + dTol))) {
+            bestD = max(bestD, rd); dStar = d;
+        }
     }
     mStarR = max(1, mStar / dStar);
 

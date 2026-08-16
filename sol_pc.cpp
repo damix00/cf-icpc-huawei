@@ -203,6 +203,15 @@ vector<int> load;      // active (unfinished) requests assigned per remote
 vector<int> decLoad;   // of those, the ones already past P POST (i.e. decoding)
 vector<double> pendProc;   // prefill compute still owed to each remote, in ms
 double decWeight = 0;      // ms of remote decode work a decoding request still represents
+// A request already placed on a remote is committed to decode there, whether or not it has got
+// past P POST yet.  Counting only decLoad prices a remote as if its whole prefill backlog were
+// going to vanish rather than turn into decode load on that same remote.
+int decUseLoad = 0;
+// ... and one decoding request does not cost one round of remote time, it costs one round per
+// token it still has to emit.  Lout is never given, but the mean tokens per finished request is
+// observable and converges from below.
+double decRounds = 0;
+long long finTok = 0, finCnt = 0;
 bool sjf = true;
 int sjfProc = 1, sjfPost = 0;           // order admissions shortest-path-first
 int activeDecode = 0;
@@ -373,6 +382,9 @@ void schedInit(const Params& p, const Table& t) {
     // marginal remote cost of carrying one more decoding request, times a nominal remaining Lout
     double slope = max(0.0, (T.c[C_DPROC].at(64.0) - T.c[C_DPROC].at(1.0)) / 63.0);
     decWeight = envD("CF_DECW", 1.0) * slope;
+    decUseLoad = (int)envD("CF_DECL", 0);
+    decRounds = envD("CF_DECR", 0.0);
+    finTok = finCnt = 0;
     uPerToken = 8.0 * P.bytesPerToken / (P.bw * 1e6);
     sjf = envD("CF_SJF", 1.0) > 0.5;
     sjfProc = (int)envD("CF_SJFP", 1);
@@ -401,11 +413,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -574,6 +582,11 @@ inline int peekPProc(int j) {
 
 // Balance by projected remote work, not request count: prefill_proc varies by orders of
 // magnitude with Lin, so counting requests leaves remotes badly skewed.
+inline double decW() {
+    if (decRounds <= 0 || finCnt == 0) return decWeight;
+    return decWeight * (1.0 + decRounds * (double)finTok / (double)finCnt);
+}
+
 inline int pickRemote() {
     int active = 0;
     for (int j = 0; j < P.K; j++) if (load[j] > 0) active++;
@@ -586,7 +599,7 @@ inline int pickRemote() {
         // Placement decides when this request reaches P PROC, and pendProc alone ignores two
         // things the remote is already committed to: the task it is running now, and the decode
         // groups already queued on it.  Both delay our P PROC by exactly their duration.
-        double cost = pendProc[j] + decWeight * decLoad[j];
+        double cost = pendProc[j] + decW() * (decUseLoad ? load[j] : decLoad[j]);
         if (remBusyW > 0) cost += remBusyW * (max(0.0, rFreeAt[j] - curT)
                                   + (qDProc[j].empty() ? 0.0 : P.S + T.c[C_DPROC].at((double)qDProc[j].size())));
         if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
@@ -594,7 +607,7 @@ inline int pickRemote() {
     if (best < 0) {
         best = 0; bestCost = 1e300;
         for (int j = 0; j < P.K; j++) {
-            double cost = pendProc[j] + decWeight * decLoad[j];
+            double cost = pendProc[j] + decW() * (decUseLoad ? load[j] : decLoad[j]);
             if (remBusyW > 0) cost += remBusyW * max(0.0, rFreeAt[j] - curT);
             if (cost < bestCost - 1e-9) { bestCost = cost; best = j; }
         }
@@ -737,6 +750,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
         if (e.type == EV_FIN) {
             int i = e.a;
             finished[i] = 1; st[i] = R_DONE;
+            finTok += tokCnt[i]; finCnt++;
             load[rem[i]]--; decLoad[rem[i]]--; activeDecode--;
         }
     }

@@ -246,6 +246,10 @@ int holdPreToo = 1;
 // ramp-up, which is the safe direction.  Only spend waiting on throughput once throughput is
 // visibly being won.  Validated causally: multiplying tp_UB by 300 and changing nothing else flips
 // the gate off and reproduces the no-swap schedule byte-for-byte (h_6_13, h_6_14, h_5_13).
+// The swap buys throughput and pays in TPOT.  excess_tpot is clamped at zero, so while the realised
+// gap sits under SLO2 that payment is free; past SLO2 every extra millisecond is charged against the
+// waiting component.  Both are known online, so the second half of the trade need not be guessed.
+double swapTpot = 1.0;
 double swapMin = 0.05;
 int swapWarm = 8;
 long long tokensOut = 0;
@@ -296,7 +300,7 @@ double tdrGuard = 0.5;      // 0 disables the guard
 // All three pass every other gate; only the expected-arrivals test separates them.
 long long arrCount = 0;
 double firstArr = -1;
-double arrExpect = 0.0;     // required expected arrivals inside the window (0 disables)
+double arrExpect = 1.0;     // required expected arrivals inside the window (0 disables)
 inline bool arrivalLikely(double window) {
     if (arrExpect <= 0) return true;
     if (arrCount < 2 || firstArr < 0) return true;      // no rate estimate yet: do not veto
@@ -401,27 +405,17 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
     holdPreToo = (int)envD("CF_HOLDPRE", 1);
     holdCap = envD("CF_HOLDCAP", 4.0);
     swapMin = envD("CF_SWAP", 0.05);
+    swapTpot = envD("CF_SWAPT", 1.0);
     swapWarm = (int)envD("CF_SWAPW", 8);
     jitPre = (int)envD("CF_JITP", 1);
     jitProc = (int)envD("CF_JITR", 3);
@@ -430,7 +424,7 @@ void schedInit(const Params& p, const Table& t) {
     jitL = (int)envD("CF_JITL", 2);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
-    arrExpect = envD("CF_ARRE", 0.0);
+    arrExpect = envD("CF_ARRE", 1.0);
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
     spanSum = 0; gapCnt = 0; lastTok.clear();
@@ -837,7 +831,8 @@ void schedFrame(double t, const Frame& f, Response& out) {
     if (P.wTp > 0 && tokensOut >= swapWarm && curT > t0) {
         double tpNow = (double)tokensOut / (curT - t0);
         double span = P.tpUB - P.tpBase;
-        if (span > 1e-12 && (tpNow - P.tpBase) / span > swapMin) dpreFirst = true;
+        bool tpotOk = swapTpot <= 0 || P.SLO2 <= 0 || gapCnt == 0 || tpotNow() < swapTpot * P.SLO2;
+        if (span > 1e-12 && (tpNow - P.tpBase) / span > swapMin && tpotOk) dpreFirst = true;
     }
 
     // ---- local computer ----

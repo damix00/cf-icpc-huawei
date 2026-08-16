@@ -405,7 +405,7 @@ void schedInit(const Params& p, const Table& t) {
     // (submission 387266525, 15968.542).  The local suites all called that change positive, the
     // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
     // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 16.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made

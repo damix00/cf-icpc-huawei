@@ -1,37 +1,104 @@
 # CLAUDE.md — CF 2251A working guide
 
 Codeforces **2251A — Edge–Cloud Collaborative Scheduling** (ICPC 2026 Online Challenge 1, Huawei).
-An **interactive** scheduling problem, scored 0–1000 per test. Contest is running; ~13 days left as
-of 2026-08-15. Account: `damix`.
+An **interactive** scheduling problem, scored 0–1000 per test. Contest is running; ~12 days left as
+of 2026-08-16. Account: `damix`.
 
 `NOTES.md` holds the full model derivation, the controller maths, and every measured dead end.
 This file is the operational guide: status, commands, and the rules that were learned the hard way.
 
 ## Status
 
-Best submission **#387160821 = 15995.995**, all 22 tests OK. Leader `ChefChampion` 16365.928 → gap
-**369.9 (2.3 %, ~16.8/test)**. Goal of beating the standings is **not** met.
+Best score **16077.404** (submission **#387266889**), all 22 tests OK. Rank **86**; the rank-50
+cutoff is now **16153.093** (`ohhaus`), so the goal is **not** met -- gap **75.7**. Rank 1 is
+16430.623. The field keeps moving, so the gap widens without new score.
 
-Submission history: `0` (idleness) → 15979.224 → 15900.424 (reverted) → 15981.743 → 15981.743 →
-15990.629 → 15952.333 (D PRE-first ungated, reverted) → 15988.091 (gated + placement) →
-**15995.995** (gated only). Codeforces keeps the **best** submission, so experimenting is safe.
+`sol.cpp` is #387266889 = the 16072.540 policy with **`CF_WAIT_P` 8.0 -> 16.0**, which moved test
+**#19 875.4 -> 880.2** and left the other 21 byte-identical. That constant is now the most
+judge-informative thing in the file -- see "the `CF_WAIT_P` gradient" below.
 
-The winning change moved exactly two tests and left the other twenty untouched:
-`#5 461.7→465.5 (+3.8)`, `#6 383.8→385.3 (+1.5)`.
+Its 16072.540 predecessor came from two mechanisms (15995.995 -> 16072.540, +76.5):
 
-**Shipped this round:** D PRE before D POST, gated on realised throughput (`swapMin`, `sol.cpp`).
-Ungated it was −38.3; the gate protects #3/#8/#13/#16 completely and keeps #5/#6. It still forgoes
-#7 (+7.3 under the ungated version), but lowering `swapMin` to reach it is measurably wrong —
-`judge/` drops to 668.84 at any threshold ≤0.02, and #8/#13/#16 (−5.7/−2.4/−0.6 ungated) would come
-back with it. `CF_SWAP=0.20` reads 669.757 on `judge/` but 0.10 and 0.35 both read 669.59, so that
-is a spike, not a plateau (rule 4).
+1. **P PRE just-in-time release** (+56) -- hold a P PRE while the uplink is still carrying another
+   *prefill*, so the shortest of a larger pool takes the FIFO slot. Both links are single-server
+   FIFOs, so their order is frozen when work is released, and the release time is ours; the old
+   code dumped every P PRE onto the link the instant E was free, making the order arrival order and
+   leaving the shortest-first pop nothing to sort. Ungated it wrecks TPOT (j_47 448 -> 5072 ms,
+   because TPOT is measured from a request's FIRST token), so it is gated to `activeDecode <= 2`
+   plus a measured TPOT-slack test and a "is mean TDR even over SLO1" guard.
+2. **Placement cost that counts committed remote work** (+19.8, all of it on test #5,
+   465.5 -> 487.3) -- `pickRemote` scored a remote by `pendProc` alone, ignoring the task it is
+   running now and the decode groups already queued on it. Both delay our P PROC by exactly their
+   duration. `CF_RBW=1` is the principled weight; `CF_DECW=1` adds the decode-load term (+0.63).
 
-**One change is parked, with a measured reason:**
-* **`pickRemote` placement/wave-width decoupling** (`sol_place2.cpp`). Worth **+229 on `h_4_15` and
-  +230 on `h_4_16`** locally — four remotes were idle for an entire 141-second run — but only +0.12
-  on `judge/` and **−8.1 on judge test #6**. Its gains live entirely in the large-`R` regime the
-  judge does not have. Keep it for the local suites; do not ship it to the judge without new
-  evidence. See `NOTES.md` §9.
+Codeforces keeps the **best** submission -- "Your points" tracks it, not the last -- so experiments
+are free and **anything shipped must beat 16077.404 to matter**. The judge takes ~1 submission per
+9 minutes and silently drops earlier ones; always confirm on `/my`.
+
+**Per-test now:** `500, 500, 500.6, 795.9, 487.3, 385.3, 907.5, 830.2, 736, 683.3, 500.2, 799.9,
+730.6, 415.3, 716.6, 980.7, 888.2, 915.7, 880.2, 998.2, 970.6, 955.2`. Tests 1/2/3/11 are capped
+near 500 (single-request instances; #1 is `tests/ex1.txt` and its 500.0000027586 is provably the
+maximum), and **#14 (415.3) has never moved under any of 25 measured submissions** -- almost
+certainly single-request and forced too. The live targets are **#6 (385.3), #5 (487.3),
+#10 (683.3), #15 (716.6), #13 (730.6), #9 (736)**.
+
+## The `CF_WAIT_P` gradient -- the one thing the judge answers loudly
+
+`waitPost` is the D POST merge-hold budget, in units of one merge saving. Three judge measurements:
+
+| `CF_WAIT_P` | judge total | what moved |
+|---|---|---|
+| 1.0 | **15968.542** (-104.0) | **#5 -70.8**, #8 -19.5, #4 -14.0, #16 -8.4, #6 +5.8, #13 +3.0 |
+| 8.0 | 16072.540 | (the long-standing default) |
+| **16.0** | **16077.404** (+4.9) | **#19 +4.8**, other 21 byte-identical |
+
+**-70.8 on test #5 is the largest single-test move ever recorded in this project.** Every local
+instrument -- including the calibrated quiet subset -- called `CF_WAIT_P=1` an improvement (+0.23 to
++0.72 per test) and called 16 a regression (quiet 739.25 against 740.56). Both were exactly
+backwards. On this constant the local suites are **anti-correlated**, and the judge is the only
+instrument. Keep walking the gradient upward one step at a time and confirm on `/my`.
+
+## Score on `tmp/quiet.list`, not on all of `judge/` — this is the headline change
+
+Seven judge-measured changes are all reproducible locally as knob flips, so the two instruments can
+be compared **per change**. The judge's 22 tests never move by more than ~1 point per test under any
+of them; `judge/`'s 40 move by up to **13.6**, because its mean is carried by a handful of
+hyper-volatile instances (`j_64` swings **-502.9** on `CF_TDRG=0` alone). **The real 22 contain
+nothing like them** — the largest single-test judge move in 23 submissions is +21.8.
+
+Splitting `judge/` by volatility (quiet = no change in that battery moves it >3 points) gives
+`tmp/quiet.list` (23 tests) and `tmp/loud.list` (17). The quiet subset reproduces the judge's
+response profile with **L1 error 1.78 against 23.75 for the full suite — 13x better**, matching sign
+and magnitude on six of seven changes. Full table and method in NOTES.md section 16.
+
+```sh
+sh score.sh sol_x.cpp "$(cat tmp/quiet.list | tr '\n' ' ')"     # THE instrument
+sh score.sh sol_x.cpp "$(cat tmp/loud.list  | tr '\n' ' ')"     # only a "did I break it" guard
+```
+
+Baseline: quiet **740.560**, loud **675.657**. Regenerate both from `tmp/deltamat.txt` if the
+battery is ever re-run.
+
+**On the quiet subset every tunable in the policy is flat within ±0.4 per test** — the only knob
+worth more is `CF_JITP=0` at -19.0, which is just the already-paid-for P PRE hold. Prefill splitting
+is monotonically worse, decode-first on remotes is -0.09, and the placement refinements are exactly
+0.000. Treat the parameter space as exhausted; only structural changes are worth a submission.
+
+## `CF_WAIT_R` 4 → 14: submitted, **exactly 0.000** on the judge
+
+`sol_wr.cpp` (`waitProc` default `4.0 → 14.0`) was submitted as **#387246342** and scored
+**16072.540 — all 22 per-test values byte-identical to #387210572, to 10 decimal places.** The
+merge hold's budget never binds differently on any judge test, exactly as it never binds on the
+small-`R` slice. Promoted into `sol.cpp` anyway, on the same insurance logic as the TDR-worth-it
+guard: `judge/` **710.728 → 712.976** from **2 winners and zero losers** (`j_53` +76.5, `j_36`
++13.2), a 12–16 plateau, zero failures anywhere, and no measurable cost on the live set.
+
+**This is the sixth judge-neutral-or-negative result in a row from knob tuning.** The judge's 22
+tests do not exercise the regimes the local suites disagree over. See "Next idea" below — rollout
+is the only remaining lever in a different class.
+
+Also last session: NOTES.md §12 — extending the merge look-ahead to *ready* (not just *running*)
+work is a real blind spot whose every exposed wait is past the merge break-even. Dead as a class.
 
 ## THE bug — never reintroduce it
 
@@ -54,41 +121,47 @@ cannot reproduce it either — files only short-read at EOF.
 ```sh
 g++ -O2 -std=gnu++17 -o sol.exe sol.cpp        # the submission
 sh score.sh sol.cpp                            # score on tests/ -> per-test + MEAN + failures
-sh score.sh sol_x.cpp "judge/*.txt"            # THE suite to trust -- see below
+sh score.sh sol_x.cpp "$(cat tmp/quiet.list|tr '\n' ' ')"   # THE instrument (23 tests, base 740.560)
+sh score.sh sol_x.cpp "judge/*.txt"            # the full 40 -- its mean is NOT trustworthy, see below
 sh mkjudge.sh                                  # (re)generate it, gen.cpp profile 9
 sh score.sh sol_x.cpp "hold/h_*.txt"           # any suite
 sh cmp.sh sol sol_x                            # per-test delta; both tags must have been
                                                #   scored on the SAME glob (score.sh overwrites
                                                #   tmp/scores_<tag>.txt each run)
 BIN=tmp/sim_sol.exe TESTS="tests/g_*.txt" sh sweep2.sh < cfgs.txt   # env sweep, one mean per line
-./sim.exe tests/g_5_3.txt -stats               # utilisation + group sizes + decode-stage breakdown
+./sim.exe tests/g_5_3.txt -stats               # utilisation, group sizes, decode-stage breakdown,
+                                               #   per-link and per-computer IDLE with the biggest
+                                               #   gaps timestamped -- says WHERE the makespan goes
+py tmp/hp.py judge/j_48.txt                    # exhaustive placement oracle (request x remote)
 ./analyze.exe <test> [tp]                      # per-test ceiling (see caveat below)
 py pipecheck.py tmp/pc/g_5_1                   # frame-by-frame replay over REAL pipes
 py protocheck.py                               # byte-dribble stdin, CRLF, empty frames, EOF, ...
 py edgegen.py edge                             # regenerate corner-case instances
+py tmp/hillclimb.py judge/j_52.txt              # what is a perfect per-frame decision worth?
+py tmp/hc2.py judge/j_46.txt                    # ... and which action should it have been?
+CF_HCLIST=tmp/hc2_best.list CF_HCTRACE=1 ./tmp/sim_hc2.exe judge/j_46.txt   # print their context
 ```
 
-### `judge/` is the suite that matters — score every candidate on it
+### `judge/`'s full mean is the wrong statistic — the volatile tests carry it
 
-`tests/`, `hold/` and `val/` draw `R = 50..2000` (`gen.cpp` profiles 0–8) and run up to **910 422
-frames**. The judge's tests finish in ≤421 ms of our CPU and never queue more than one request on a
-remote's prefill queue. Only 24 of 116 local tests have `R ≤ 50`, so the other 92 vote on a regime
-the judge never runs — which is exactly why full-suite means stopped predicting judge deltas.
+`judge/` (`sh mkjudge.sh`, `gen.cpp` profile 9) reproduces the judge envelope: `R` 1-59, frames
+21-18 363, `w_tp` mostly from `{0, 0.25, 0.4, 0.5}`, and instances at `tpComp ~= 0` with `R > 1`.
+Its *instances* are right; its *mean* is not, because 17 of the 40 swing by tens or hundreds of
+points under changes the judge barely notices:
 
-`judge/` (`sh mkjudge.sh`, `gen.cpp` profile 9) reproduces the judge envelope: `R` 1–59 (18 %
-single-request), frames 21–18 363, `w_tp` drawn mostly from `{0, 0.25, 0.4, 0.5}`, and — critically —
-instances at `tpComp ≈ 0` with `R > 1`, the class that cost submission 387157181 its −42.1 and that
-**no profile 0–8 test reproduces**.
-
-It is so far the only local instrument that gets the sign right on a real judge measurement:
-
-| variant | judge | `judge/` | 116-suite |
+| change | `judge/` all 40 | quiet 23 | real judge |
 |---|---|---|---|
-| 387125285 baseline | 15990.629 | 669.348 | 839.580 |
-| + D PRE-first, ungated | 15952.333 | **668.754** | 840.296 |
-| + D PRE-first, gated | 15988.091 | **669.718** | 844.414 |
+| JIT prefill-down release | **+8.03** | -0.027 | **-0.04** (full suite gets the sign wrong) |
+| TDR-worth-it guard | +13.63 | +0.007 | 0.00 |
+| local order D POST first | -0.289 | +0.019 | -0.266 |
+| first-token deferral | **+3.83** | -0.241 | **-1.048** |
+| P PRE reorder, `activeDecode == 0` | +20.2 | -- | +1.70 |
+| `CF_JITS=3` | +0.24 | +0.108 | +0.008 |
 
-The 116-suite ranked the losing change as an improvement; `judge/` did not.
+**Score `tmp/quiet.list` first.** The full-40 mean over-predicts by ~10x and has got the sign wrong
+twice; the quiet subset has an L1 error of 1.78 across the whole battery against 23.75. Then check
+small-`R`, then the big suites as a regression guard, then `tmp/loud.list` only to confirm nothing
+was destroyed. Full derivation in NOTES.md section 16.
 
 Also keep the small-`R` slice of the old suites as a second opinion:
 
@@ -173,14 +246,34 @@ in flight, so a stuck state is impossible.
 
 Tunables are `getenv`-overridable (`CF_*`) for sweeping; **defaults are what the judge runs.**
 
-## Next idea (untried)
+## Next idea — NOT rollout. That family is now bounded and closed. See NOTES.md §14.
 
-**Rollout / lookahead.** The model is exact and deterministic apart from future arrivals and the
-hidden `Lout`, and ~35× of the time limit is unused. Evaluating candidate actions by simulating
-forward with the *exact* simulator — instead of the analytic model, which is 3–5× optimistic in
-absolute terms — is the only remaining approach in a different algorithmic class. Every policy
-lever (splitting, wave depth, group capping, admission pacing, priority orders, remote placement)
-is already at a local optimum; see the rejected-ideas table in `NOTES.md` before retrying any.
+**Do not build rollout.** It was already built once (`sol_v9_x.cpp`, `Roll::`, +0.15 on `judge/`),
+and this session measured the *ceiling* rather than another implementation. `sol_hc3.cpp` +
+`tmp/hc3.py` hill climb an **oracle with perfect hindsight** over the local computer's per-frame
+choice — an upper bound on any online policy for that family, rollout included. Exhaustive over
+every frame it is worth **+4 to +7 per test on `judge/`**, i.e. **~+9 to +15 across the real 22**,
+against a **74.2**-point gap. The headroom rollout was designed to capture was already harvested by
+the P PRE JIT release (j_46 +41.6 → +1.85). §14a then implemented the one residual shape the oracle
+found that was not already refuted, and it measured **−0.28 on the very test that motivated it**.
+
+**Those families are now measured too** (NOTES §15). The exhaustive placement oracle (`sol_hp.cpp` +
+`tmp/hp.py`, every request × every remote, hill climbed to convergence) finds +0 to +15 per test, but
+its `j_48` trace shows the wins are mostly *relabelling* — `was=0 now=1` with both remotes still
+empty, which only reorders the uplink FIFO. Pricing the `dStar` veto on opening a fresh remote
+(`sol_op.cpp`, `CF_OPEN`) and both placement-cost refinements (`sol_pc.cpp`, `CF_DECL` / `CF_DECR`)
+are **exactly 0.000 on `tmp/quiet.list`**. Prefill pacing is dead outright: ungating the P PRE hold
+moves throughput by ±0.005 on every test while destroying waiting.
+
+Before retrying anything else, read the rejected-ideas tables in `NOTES.md` §5, §10, §14, §15, §16.
+
+**What is actually left.** On `tmp/quiet.list` the headroom against the (optimistic) work floor is
++28.5 per test, concentrated in `j_48` +163, `j_67` +128, `j_68` +111, `j_32` +80. The new
+per-computer idle accounting says those tests idle **every resource simultaneously** in repeated
+400–600 ms blocks — a latency-bound closed loop with too few live requests, not a contended one.
+There is nothing to re-order there, which is why no knob touches them. Any further gain has to come
+from a change that raises decode concurrency on a latency-bound instance, or the work floor is
+simply unreachable and 16072.540 is close to this architecture's ceiling.
 
 ## The one rule this round added
 

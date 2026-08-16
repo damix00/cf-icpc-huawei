@@ -401,11 +401,12 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    // The budget for the D POST merge hold, in units of one merge saving.  8.0 was an early fit;
+    // 1.0 is the break-even the quantity is *defined* by -- waiting longer than the merge saves is
+    // a loss by construction, and `eBottleW` already imposed exactly this cap whenever the local
+    // computer was the bottleneck.  On the calibrated quiet subset (NOTES 16) 1..2 is a plateau at
+    // +0.23/test with 8..10 falling away; judge/ +0.44, loud +0.72, hold/ +0.48, small-R -0.09.
+    waitPost = envD("CF_WAIT_P", 1.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made

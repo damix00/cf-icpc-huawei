@@ -336,6 +336,14 @@ inline bool tdrWorthIt() {
 // during ramp-up almost no TPOT window is open yet, so the reordering is free.  Offline hill
 // climbing over per-frame decisions picks exactly these frames and nothing else.
 int jitPre = 1, jitProc = 3, jitMode = 1;
+
+// ---- offline decision-search harness (diagnostic; sol_hc3 only) ------------------------------
+// Same hook as sol_hc2.cpp, rebased onto the current policy so the hill climb measures the
+// headroom that is LEFT after the P PRE just-in-time release and the placement-cost fix, not the
+// headroom those two already harvested.  CF_HCLIST names a file of "frame choice" pairs: choice
+// -1 forces the local computer to idle at that frame, 0..3 force D POST / P POST / D PRE / P PRE.
+map<long long, int> hcMap;
+long long hcFrame = 0;
 int jitL = 2;                // hold P PRE only while at most this many requests are decoding
 double jitSlack = 3.0;
 
@@ -401,11 +409,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -437,6 +441,11 @@ void schedInit(const Params& p, const Table& t) {
     deferFirst = (int)envD("CF_DEFER", 0);
     deferSlo = envD("CF_DEFSLO", 1.0);
     tokensOut = 0;
+    hcMap.clear(); hcFrame = 0;
+    if (const char* fn = getenv("CF_HCLIST")) {
+        FILE* fp = fopen(fn, "r");
+        if (fp) { long long f; int c; while (fscanf(fp, "%lld %d", &f, &c) == 2) hcMap[f] = c; fclose(fp); }
+    }
 }
 
 // Predicted token rate for L live requests running as waves of m spread over d remotes.
@@ -841,6 +850,9 @@ void schedFrame(double t, const Frame& f, Response& out) {
     }
 
     // ---- local computer ----
+    long long myFrame = hcFrame++;
+    int hcWant = -2;
+    { auto it = hcMap.find(myFrame); if (it != hcMap.end()) hcWant = it->second; }
     if (!eBusy) {
         int choice = -1;   // 0 = D POST, 1 = P POST, 2 = D PRE, 3 = P PRE
         const char* ord = prefillUrgent ? ordAdmit : ordDecode;
@@ -856,6 +868,23 @@ void schedFrame(double t, const Frame& f, Response& out) {
             if ((c == 0 && !qDPost.empty() && !holdPost) || (c == 1 && !qPPost.empty()) ||
                 (c == 2 && !eligDPre.empty() && !(holdPost && holdPreToo)) ||
                 (c == 3 && !qPPre.empty() && !holdPPre)) choice = c;
+        }
+        if (hcWant != -2 && inFlight) {
+            int c = hcWant;
+            bool ok = (c == 0 && !qDPost.empty()) || (c == 1 && !qPPost.empty())
+                   || (c == 2 && !eligDPre.empty()) || (c == 3 && !qPPre.empty());
+            if (c == -1 || ok) {
+                if (getenv("CF_HCTRACE")) {
+                    static const char* nmT[4] = {"DPOST", "PPOST", "DPRE", "PPRE"};
+                    fprintf(stderr, "PICK f=%lld t=%.3f was=%s now=%s qDPre=%d qDPost=%d qPPre=%d "
+                                    "qPPost=%d mStar=%d dStar=%d L=%d up=%.3f dn=%.3f\n",
+                            myFrame, t, choice < 0 ? "idle" : nmT[choice], c < 0 ? "idle" : nmT[c],
+                            (int)qDPre.size(), (int)qDPost.size(), (int)qPPre.size(),
+                            (int)qPPost.size(), mStar, dStar, activeDecode,
+                            max(0.0, upFreeAt - t), max(0.0, downFreeAt - t));
+                }
+                choice = c;
+            }
         }
         if (choice == 0) {
             Assign& A = newAssign(out, -1, ST_DPOST, -1);

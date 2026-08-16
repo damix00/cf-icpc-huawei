@@ -313,6 +313,38 @@ inline bool tdrWorthIt() {
     return sum > tdrGuard * P.SLO1 * (double)cnt;
 }
 
+// ---- P POST priority only ever buys a component that may already be maxed out ----------------
+// TDR's clock stops at P POST, so where P POST sits in the local computer's preference order can
+// only ever move the waiting component -- it cannot move throughput, because a request produces no
+// tokens until well after P POST.  The waiting component is
+//   dist = hypot(max(0,(tdr-SLO1)/SLO1), max(0,(tpot-SLO2)/SLO2)),  waitComp = 1 - dist/distBase
+// with both excesses clamped at zero.  So when the projected mean TDR sits under SLO1 and the
+// realised TPOT sits under SLO2, waitComp is already exactly 1.0 and running P POST *early* buys
+// literally nothing -- while the decode step it displaces is what shortens the makespan, and tp is
+// totalTokens/elapsed with totalTokens fixed.
+//
+// This is the same rule as swapMin and tdrWorthIt: never spend to improve a component that is
+// already at its cap.  It is deliberately narrower than the WSPT value-density index of section 10
+// (which measured -6.7 on judge/): one step, one direction, and it fires only on a proof that the
+// thing it gives up is worthless, never on an estimate of what it gains.
+//
+// The TDR projection is the same forward-looking one tdrWorthIt uses -- realised TDR for requests
+// past P POST, plus for each request still upstream at least the time it has already waited and at
+// least its uncontended path cost.  It has to be forward-looking because the interesting frames are
+// during ramp-up, when almost nothing has completed.
+double postDemote = 0.0;    // margin as a fraction of each SLO; 0 disables
+inline bool postSaturated() {
+    if (postDemote <= 0) return false;
+    long long cnt = tdrCnt + outCnt;
+    if (cnt == 0) return false;                       // no estimate yet: do not fire
+    double sum = tdrSum + max((double)outCnt * curT - outArrSum, outCostSum);
+    if (sum > postDemote * P.SLO1 * (double)cnt) return false;
+    // TPOT is only measured once a request has produced a second token; until then there is no
+    // realised gap and no evidence, so require some before acting on it.
+    if (gapCnt == 0) return false;
+    return tpotNow() <= postDemote * P.SLO2;
+}
+
 // ---- just-in-time release to the two FIFO links -----------------------------------------
 // Both links are single-server FIFOs, so the order of work on them is frozen the moment we
 // release it -- and the release time is ours to choose.  Starting a prefill while the link is
@@ -401,11 +433,7 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -430,6 +458,7 @@ void schedInit(const Params& p, const Table& t) {
     jitL = (int)envD("CF_JITL", 2);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
+    postDemote = envD("CF_PDEM", 0.0);
     arrExpect = envD("CF_ARRE", 0.0);
     arrCount = 0; firstArr = -1;
     tdrSum = 0; tdrCnt = 0; outArrSum = 0; outCostSum = 0; outCnt = 0;
@@ -850,6 +879,14 @@ void schedFrame(double t, const Frame& f, Response& out) {
             for (; ord[n] && n < 7; n++) ordBuf[n] = ord[n] == '0' ? '2' : ord[n] == '2' ? '0' : ord[n];
             ordBuf[n] = 0;
             ord = ordBuf;
+        }
+        char ordBuf2[8];
+        if (postSaturated()) {     // move P POST to the back; the rest keep their relative order
+            int n = 0;
+            for (int k = 0; ord[k] && n < 7; k++) if (ord[k] != '1') ordBuf2[n++] = ord[k];
+            if (n < 7) ordBuf2[n++] = '1';
+            ordBuf2[n] = 0;
+            ord = ordBuf2;
         }
         for (int p = 0; ord[p] && choice < 0; p++) {
             int c = ord[p] - '0';

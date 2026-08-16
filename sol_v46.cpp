@@ -336,6 +336,7 @@ inline bool tdrWorthIt() {
 // during ramp-up almost no TPOT window is open yet, so the reordering is free.  Offline hill
 // climbing over per-frame decisions picks exactly these frames and nothing else.
 int jitPre = 1, jitProc = 3, jitMode = 1;
+double holdWc = 0.0;   // skip the P PRE hold when the waiting component is worth less than this
 int jitL = 2;                // hold P PRE only while at most this many requests are decoding
 double jitSlack = 3.0;
 
@@ -401,21 +402,10 @@ void schedInit(const Params& p, const Table& t) {
     holdProcSince.assign(P.K, -1.0);
     busyE = busyUp = busyDn = 0; busyR.assign(P.K, 0.0);
     eFreeAt = 0; rFreeAt.assign(P.K, 0.0);
-    // JUDGE-MEASURED GRADIENT: 8.0 -> 1.0 cost -104.0 on the judge, -70.8 of it on test #5 alone
-    // (submission 387266525, 15968.542).  The local suites all called that change positive, the
-    // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
-    // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 32.0);
+    waitPost = envD("CF_WAIT_P", 8.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
-    // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
-    // before the link predictor could see across the remote stage.  With the full look-ahead in
-    // place the budget is what limits how many decode members a remote can gather, and 4x cuts
-    // waves short on exactly the instances where the uplink delivers members in a slow trickle.
-    // 12-16 is a genuine plateau (judge/ 712.976 at both 12 and 16, 711.06 at 8, 712.77 at 24)
-    // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
-    // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
-    waitProc = envD("CF_WAIT_R", 14.0);
+    waitProc = envD("CF_WAIT_R", 4.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -428,6 +418,7 @@ void schedInit(const Params& p, const Table& t) {
     jitSlack = envD("CF_JITS", 3.0);
     jitMode = (int)envD("CF_JITM", 1);
     jitL = (int)envD("CF_JITL", 2);
+    holdWc = envD("CF_HOLDWC", 0.0);
     tpotMargin = envD("CF_TPOTM", 0.75);
     tdrGuard = envD("CF_TDRG", 0.5);
     arrExpect = envD("CF_ARRE", 0.0);
@@ -793,7 +784,12 @@ void schedFrame(double t, const Frame& f, Response& out) {
     // early.  Hold, and let the queue grow into something worth sorting.
     bool holdPPre = false;
     bool tpotRoom = tpotMargin > 0 && P.SLO2 > 0 && gapCnt > 0 && tpotNow() < tpotMargin * P.SLO2;
-    if (jitPre && (activeDecode <= jitL || tpotRoom) && tdrWorthIt()
+    // The hold buys mean TDR and pays in throughput and TPOT.  tdrWorthIt() asks whether TDR has
+    // any excess left to remove; this asks whether removing it is worth anything at all.  On a
+    // w_c = 0.25 instance a perfect waiting component is worth 250 points and the throughput it
+    // costs is worth 750 -- the trade is simply the wrong way round, whatever the excess.
+    bool waitPays = P.wC >= holdWc;
+    if (jitPre && waitPays && (activeDecode <= jitL || tpotRoom) && tdrWorthIt()
         && !qPPre.empty() && pendingTransfers > 0) {
         int i = peekPPre();
         double lim = jitMode ? lastPreFin(true) : upFreeAt;
