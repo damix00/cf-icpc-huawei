@@ -68,6 +68,11 @@ Four judge measurements now bracket it:
 | `CF_WAIT_P=8` | 16072.540 | the old default |
 | `CF_WAIT_P=16` | **16077.404** (+4.9) | #19 +4.8, other 21 byte-identical |
 | `CF_EBW=16` (clamp released) | 16077.404 (**0.000**) | nothing — the clamp never binds |
+| `mStar = L` (`sol_mall.cpp`) | 16062.24 (**-15.2**) | **#7 -14.6**, #6 -0.5, #5 +0.1 |
+
+**Test #7 is the constraint on this axis.** It is also the test the first-token deferral cost 13.2.
+Both changes delay a token that was already ready, so #7 is TPOT-critical — while #19 pays for
+exactly the opposite. Any further batching has to be *conditional on TPOT slack*, not uniform.
 
 So the merge hold's **budget** is now slack: `waitPost` 16 and 32 are byte-identical on every local
 suite, `holdCap` 4 and 16 likewise, and `eBottleW` is measured inert on the judge. What still caps a
@@ -77,8 +82,7 @@ Ready to submit, each building under C++17/20/23 with **zero failures across eve
 
 | file | change | local `judge/` |
 |---|---|---|
-| `sol_mall.cpp` | `mStar = max(mStar, L)` — target the whole live decode population | 711.58 (-0.64) |
-| `sol_tb.cpp` | `CF_TPOTB` — budget the holds by measured TPOT slack, not merge savings | 712.23 (+0.00) |
+| `sol_tb.cpp` | `CF_TPOTB=1` — **replace** the fitted budget with the measured TPOT slack `SLO2 - tpotNow()`, floored at one merge saving. Grows the hold where SLO2 is loose (what #19 pays for) and shrinks it to break-even where TPOT is tight (what #7 needs). | 712.65 (+0.42) |
 | `sol_p32.cpp` | `waitPost` 16 -> 32 | 712.21 (-0.01) |
 | `sol_hc16.cpp` | `holdCap` 4 -> 16 | 712.22 (byte-identical) |
 

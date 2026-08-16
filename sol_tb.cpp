@@ -424,7 +424,7 @@ void schedInit(const Params& p, const Table& t) {
     // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
     // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
     waitProc = envD("CF_WAIT_R", 14.0);
-    tpotBudget = envD("CF_TPOTB", 0.5);
+    tpotBudget = envD("CF_TPOTB", 1.0);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
@@ -791,9 +791,14 @@ void schedFrame(double t, const Frame& f, Response& out) {
     bool holdPost = false;
     if (inFlight && !qDPost.empty() && (int)qDPost.size() < mStar && batchingHelpsBottleneck(mStar)) {
         double t1 = min(nextDecAt(false, -1), nextDownAfterProc());
-        double budget = waitBudget(waitPost) * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
-        if (tpotBudget > 0 && P.SLO2 > 0)
-            budget = max(budget, tpotBudget * max(0.0, P.SLO2 - tpotNow()));
+        double ms1 = mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
+        double budget = waitBudget(waitPost) * ms1;
+        // Once there is a TPOT measurement, use the slack itself as the budget: it both GROWS the
+        // hold where SLO2 is loose (#19 pays 4.9 for that) and SHRINKS it to the break-even where
+        // TPOT is tight (#7 loses 14.6 whenever a ready token is delayed).  One merge saving is the
+        // floor because that is the point at which the merge stops paying for its own wait.
+        if (tpotBudget > 0 && P.SLO2 > 0 && gapCnt > 0)
+            budget = max(ms1, tpotBudget * max(0.0, P.SLO2 - tpotNow()));
         if (holdPostSince < 0) holdPostSince = t;
         if (t1 - t <= budget && t - holdPostSince <= holdCap * budget) holdPost = true;
     }
@@ -914,9 +919,10 @@ void schedFrame(double t, const Frame& f, Response& out) {
         // same trade-off on the remote: a bigger D PROC costs one S instead of two
         if (doDecode && inFlight && (int)qDProc[j].size() < mStarR && batchingHelpsBottleneck(mStarR)) {
             double t1 = min(nextDecAt(true, j), nextUpAfterPre(j));
-            double budget = waitProc * mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
-            if (tpotBudget > 0 && P.SLO2 > 0)
-                budget = max(budget, tpotBudget * max(0.0, P.SLO2 - tpotNow()));
+            double ms2 = mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
+            double budget = waitProc * ms2;
+            if (tpotBudget > 0 && P.SLO2 > 0 && gapCnt > 0)
+                budget = max(ms2, tpotBudget * max(0.0, P.SLO2 - tpotNow()));
             if (holdProcSince[j] < 0) holdProcSince[j] = t;
             if (t1 - t <= budget && t - holdProcSince[j] <= holdCap * budget) doDecode = false;
             else holdProcSince[j] = -1;
