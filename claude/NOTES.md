@@ -1451,5 +1451,10 @@ the incomplete-round guard and the TPOT-slack candidate are all *exactly* judge-
 kept because they are free on the seen tests and raise `hold/` +12.5 and `judge/` +7.3, and the
 final ranking is on 20 tests nobody has seen.
 
-Running tally of this architecture's judge probes: **+6.216**, **-3.164**. Best **16115.479**
-(#387321232).
+The revert was submitted as **#387324056** and scored **16115.479 exactly** -- all 22 per-test
+values byte-identical to #387321232. That confirms the isolation: `CF_SELES` was the entire
+regression, and the machinery kept alongside it costs nothing.
+
+Running tally of this architecture's judge probes: **+6.216**, **-3.164**, **+3.164 (revert)**.
+Best **16115.479**; `claude/sol.cpp` is #387324056, which carries the extra machinery at zero cost
+on the seen tests.

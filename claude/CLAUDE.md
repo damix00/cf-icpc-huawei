@@ -83,4 +83,37 @@ submissions climbing a locally-invisible ladder.**
 
 ## Current work
 
-Fresh architecture — nothing built yet.
+**SimSelect** — `claude/sol.cpp`. The solution carries an exact simulator of its own environment and
+chooses its policy vector *per instance, online, by simulating*, instead of shipping one globally
+fitted compromise. Full write-up in `NOTES.md` §21.
+
+* **Judge best: 16115.479** (#387324056), up from 16109.263.
+* `CF_SEL=0` is byte-identical to `ref.cpp` on all 183 local instances — the fallback is the old
+  16109.263 behaviour exactly.
+* Local: `judge/` +7.31, `tests/` +5.16, `hold/` +12.50, `val/` +5.42, `edge/` −0.001, zero failures.
+
+### The thing worth remembering
+
+`tp_base` **reveals the hidden total output-token count.** It is by definition the throughput of the
+reference schedule (one request at a time, whole prefill, groups of 1), whose makespan is a known
+monotone function of the arrivals, the `L_in` values and `T = sum(L_out)`. Bisection inverts it:
+median error **0.000 %** over 158 local instances (`claude/tmp/infer.py`). NOTES §19 had closed the
+whole "schedule by remaining work" family on the grounds that `L_out` is never revealed.
+
+### Submitting
+
+Codeforces rejects sources over **65535 characters** and the form fails *silently* — the error lives
+only in the page DOM. `claude/sol.cpp` is the documented master; ship
+`claude/sol_submit.cpp`, produced by `py claude/tmp/strip.py claude/sol.cpp claude/sol_submit.cpp`
+and verified byte-identical in behaviour. Always read the DOM for an error after clicking submit.
+
+### Tools built this session
+
+| path | what |
+|---|---|
+| `claude/tmp/oracle.py` | per-instance policy oracle over any suite — the measurement that justified the architecture |
+| `claude/tmp/infer.py` / `infer2.py` | validation of the token-total inference |
+| `claude/tmp/selsweep.py` | sweeps selector gates across `judge/`, `hold/` and `val/` at once, reporting losers |
+| `claude/tmp/strip.py` | literal-aware comment stripper for the 64 KB source limit |
+| `claude/sol_ora.cpp` | `ref.cpp` + fixed-(d,m) override; the Stage A instrument |
+| `CF_TRUTH=<test>` | diagnostic: hands the belief the real instance, separating engine / belief / selection error |
