@@ -236,6 +236,15 @@ double holdPostSince = -1;
 vector<double> holdProcSince;
 double waitPost = 8.0, waitProc = 4.0, holdCap = 4.0, warmUp = 100.0, dTol = 0.04;
 int holdPreToo = 1;
+// A D POST merge hold exists to have the local computer FREE at the instant its merge member lands.
+// Unblocking D PRE during the hold was submitted as 387282957 and cost -7.9 (#4 -4.3, #8 -2.7,
+// #6 -0.8): whatever E starts during a hold is still running when the member arrives, so the merged
+// D POST queues behind it and the hold pays its wait for nothing.  But a blanket block idles E for
+// the whole wait, and the arrival time is already computed -- t1, the same estimate the budget test
+// uses.  So allow exactly the tasks that PROVABLY finish first: a step may run during a hold iff
+// t + S + its duration <= t1.  That fills the hold with useful work without ever delaying the merge,
+// which is strictly better than either a full block or a full pass-through.
+int holdFit = 1;
 // D PRE vs D POST on the local computer.  D PRE hands work DOWNSTREAM (the uplink, then a remote);
 // D POST only refills a queue E already owns.  Running D PRE first therefore keeps the pipeline fed
 // -- worth +3.9 across 21 of the judge's 22 tests (submission 387157181).  On the 22nd it cost
@@ -405,7 +414,7 @@ void schedInit(const Params& p, const Table& t) {
     // (submission 387266525, 15968.542).  The local suites all called that change positive, the
     // calibrated quiet subset included -- so this constant is one the judge, and only the judge,
     // can be trusted on.  Probing 8 -> 16 up the measured gradient.
-    waitPost = envD("CF_WAIT_P", 512.0);
+    waitPost = envD("CF_WAIT_P", 32.0);
     eBottleW = envD("CF_EBW", 1.0);
     remBusyW = envD("CF_RBW", 1.0);
     // The D PROC merge hold on a remote was budgeted at 4x one merge saving, an early fit made
@@ -420,6 +429,7 @@ void schedInit(const Params& p, const Table& t) {
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
     holdPreToo = (int)envD("CF_HOLDPRE", 1);
+    holdFit = (int)envD("CF_HOLDFIT", 1);
     holdCap = envD("CF_HOLDCAP", 4.0);
     swapMin = envD("CF_SWAP", 0.05);
     swapWarm = (int)envD("CF_SWAPW", 8);
@@ -780,8 +790,10 @@ void schedFrame(double t, const Frame& f, Response& out) {
     // task's fixed cost -- worth it exactly while the wave is still short of its target size and
     // the next arrival is closer than the work we would otherwise be doing.
     bool holdPost = false;
+    double holdT1 = 1e300;
     if (inFlight && !qDPost.empty() && (int)qDPost.size() < mStar && batchingHelpsBottleneck(mStar)) {
         double t1 = min(nextDecAt(false, -1), nextDownAfterProc());
+        holdT1 = t1;
         double budget = waitBudget(waitPost) * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
         if (holdPostSince < 0) holdPostSince = t;
         if (t1 - t <= budget && t - holdPostSince <= holdCap * budget) holdPost = true;
@@ -853,9 +865,26 @@ void schedFrame(double t, const Frame& f, Response& out) {
         }
         for (int p = 0; ord[p] && choice < 0; p++) {
             int c = ord[p] - '0';
-            if ((c == 0 && !qDPost.empty() && !holdPost) || (c == 1 && !qPPost.empty()) ||
-                (c == 2 && !eligDPre.empty() && !(holdPost && holdPreToo)) ||
-                (c == 3 && !qPPre.empty() && !holdPPre)) choice = c;
+            // During a hold, only a task that provably completes before the merge member lands.
+            bool fits = true;
+            if (holdPost && holdFit && c != 0) {
+                double dur = -1;
+                if (c == 1 && !qPPost.empty()) {
+                    int i = qPPost.front();
+                    if (sjfPost)
+                        for (size_t k = 1; k < qPPost.size(); k++)
+                            if (tdrCost[qPPost[k]] < tdrCost[i]) i = qPPost[k];
+                    dur = T.c[C_PPOST].at((double)lin_[i]);
+                } else if (c == 2 && !eligDPre.empty()) {
+                    dur = T.c[C_DPRE].at((double)eligDPre.size());
+                } else if (c == 3 && !qPPre.empty()) {
+                    dur = T.c[C_PPRE].at((double)lin_[peekPPre()]);
+                }
+                if (dur >= 0) fits = (t + P.S + dur <= holdT1);
+            }
+            if ((c == 0 && !qDPost.empty() && !holdPost) || (c == 1 && !qPPost.empty() && fits) ||
+                (c == 2 && !eligDPre.empty() && (holdFit ? fits : !(holdPost && holdPreToo))) ||
+                (c == 3 && !qPPre.empty() && !holdPPre && fits)) choice = c;
         }
         if (choice == 0) {
             Assign& A = newAssign(out, -1, ST_DPOST, -1);

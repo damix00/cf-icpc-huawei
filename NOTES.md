@@ -1000,3 +1000,238 @@ budget large, and leave `mStar` where the rate model puts it.* That is exactly `
 The step is **accelerating**, and every local suite calls 16, 32 and 64 byte-identical -- the budget
 stops binding *locally* above 16, so no local instrument can see this at all. Test #19 has 87.9
 points still on the table. `sol.cpp` = `sol_best_16109.cpp` = `waitPost` 32; next probe is 128.
+
+
+## 18. The hold's *block set* is a live judge axis, and the local suites read it backwards
+
+Section 17 found the D POST merge hold's **budget** (`CF_WAIT_P`) to be a judge-only gradient worth
++36.7, saturating at 32.  This section closes the budget and opens the mechanism next to it.
+
+### 18a. The budget is saturated -- `holdCap` is not binding either
+
+`waitPost` 32 -> 128 (`sol_p128.cpp`, submission **387281899**) scored **16109.263 -- all 22 per-test
+values byte-identical** to the 32 baseline (387270011).  Both hold tests scale linearly with the
+budget:
+
+```c
+if (t1 - t <= budget && t - holdPostSince <= holdCap * budget) holdPost = true;
+```
+
+so quadrupling `budget` quadruples `holdCap * budget` too.  Neither changing anything means **neither
+test binds anywhere on the judge**.  That kills `sol_p512.cpp` and `sol_hc32.cpp` outright -- no
+probe on either constant can move a single point.  The only remaining cap on a D POST group is
+`qDPost.size() < mStar`.
+
+### 18b. Raising `mStar` under a TPOT-slack gate: refuted locally, not submitted
+
+`sol_ms.cpp` (`CF_MSLACK` / `CF_MSLACKM`) lets the D POST hold target `mStar * mSlack`, clamped to
+`activeDecode`, while the measured TPOT still sits under `mSlackM * SLO2` -- the argument being that
+TPOT excess is clamped at zero, so stretching a token gap under SLO2 costs the scorer nothing.  At
+`mSlack = 2`, `mSlackM = 0.5` it reads **-1.486 on `tmp/quiet.list`**, and it is not diffuse: j_36
+**-20.4** and j_34 **-16.0** against j_63 +3.6 and j_46 +1.1.
+
+The reason is in `waveRate` and it is structural, not a tuning miss.  Its own-round-trip term is
+`r = L / C` with `C = 3S + dpre(m) + dproc + dpost(m) + 2 up(m)`: with `L` requests live, each emits
+one token per cycle, so total rate is `L / C` **regardless of m**.  Merging more members lengthens
+`C` without raising `L`, so past the model's optimum a bigger group is a straight throughput loss.
+The rate model is *right* to stop at `mStar`.  What the budget bought on #19 was reaching `mStar`,
+not exceeding it.  **Do not retry the "TPOT slack makes merging free" family** -- TPOT slack makes
+the *waiting* free, and the cost was never waiting.
+
+### 18c. Smoothing the wave shape: flat
+
+`tmp/wave_oracle.txt` sweeps a **fixed** `(d, m)` pair with hindsight over all 40 `judge/` instances
+and beats the adaptive `retarget()` on 20 of them, **+3.54 mean** (j_47 +26.8 at d=1 m=1, j_48 +17.9
+at d=2 m=8, j_45 +16.6, j_53 +12.7, j_69 +11.9, j_66 +9.5).  The obvious reading is that `retarget()`
+re-solves from the instantaneous decode population and therefore oscillates all run, and that the
+oscillation itself costs more than tracking gains.
+
+It does not.  `sol_hy.cpp` (`CF_RETEMA`) picks the shape from an EMA of `activeDecode` instead:
+
+| alpha | 0 | 0.01 | 0.02 | 0.05 | 0.1 | 0.25 | 0.5 |
+|---|---|---|---|---|---|---|---|
+| quiet | 739.248 | 737.742 | 739.272 | 739.126 | 739.302 | 739.235 | 739.235 |
+
+Flat within +-0.06 across two decades of smoothing.  The oracle's gain is in the *value* of the
+fixed shape, not its stability -- and the winners split into "m=1, small d" and "m large, d large"
+with the model landing between them, which no online statistic distinguishes.  Dead as a class.
+
+### 18d. What the hold lets a resource do instead is worth more than the hold's length
+
+`holdPreToo = 0` (`sol_hp0.cpp`, submission **387282957**) unblocks D PRE on the local computer while
+a D POST merge hold is running.  It scored **16101.368, -7.895**:
+
+| test | 16109.263 | holdPreToo=0 | delta |
+|---|---|---|---|
+| #4 | 795.93 | 791.68 | **-4.25** |
+| #8 | 830.24 | 827.54 | **-2.70** |
+| #6 | 385.34 | 384.53 | -0.81 |
+| #13 | 730.63 | 730.42 | -0.21 |
+| #10 | 683.25 | 683.21 | -0.04 |
+| #16 | 980.65 | 980.76 | +0.11 |
+
+Two things fall out of this, and the second is the more useful one.
+
+**The mechanism.** The point of the hold is to have E *free* at the instant the merge member lands.
+Any task started during the hold makes E busy at exactly that moment, and the merged D POST then
+queues behind it -- so the hold pays its wait and collects none of its saving.  The block set is
+therefore not a detail of the hold, it is the hold.
+
+**The fingerprint.** These six tests are a completely different set from the ones the *budget* moves.
+`CF_WAIT_P` moves **#19** and nothing else; `CF_HOLDPRE` moves **#4, #6, #8, #10, #13, #16** and not
+#19.  #5 owns the budget only at the bottom end and is untouched by the block set; #7 is indifferent
+to both while being TPOT-critical.  So at least eight of the 22 tests run D POST merge holds, and
+they respond on two independent axes.
+
+**The calibration.** `tmp/quiet.list` scored `holdPreToo = 0` at **+0.128**.  The judge scored it at
+**-7.895** -- the sign is inverted, on the same knob, in the same direction the budget axis was read
+backwards in section 17.  The reason is the same: locally the budget never binds, so local holds are
+short and what E does during them barely matters; on the judge the holds are long by construction
+(`t1 - t <= 32 * mergeSaving` only fires when the next member is genuinely far away).  **The local
+suites cannot see any property of a long hold.**  Treat a small local negative on this axis as
+weak evidence *for* a change, not against it.
+
+### 18e. The block set is incomplete on both computers -- two probes
+
+`ordDecode = "0213"` is D POST, D PRE, P POST, P PRE.  A D POST hold blocks entries 0 and 2 only, so
+during every hold the local computer falls through to **P POST, then P PRE** -- which is precisely
+the thing 18d just priced at -7.9 for D PRE.  `sol_hb.cpp` turns `holdPreToo` into a bit mask
+(1 = D PRE, 2 = P POST, 4 = P PRE) and defaults it to **3**.
+
+| mask | 1 (current) | 3 | 5 | 7 |
+|---|---|---|---|---|
+| quiet | 739.248 | 738.392 | 739.234 | 738.774 |
+
+The remote computers have the identical hole.  When the D PROC merge hold clears `doDecode`, control
+falls straight through to `qPProc[j]` and the remote starts a prefill chunk -- busy exactly when its
+merge member arrives.  `sol_hpb.cpp` (`CF_HOLDPROCB`, default 1) skips the P PROC branch when the
+decode was suppressed *by the hold* specifically.  Quiet reads -0.004, i.e. nothing, which on this
+axis is not evidence either way.
+
+Both build under C++17/20/23, take zero failures across `edge/ tests/ hold/ val/ judge/`, and pass
+protocheck 8/8.  Every hold involved is still gated on `inFlight`, so no stuck state is reachable.
+
+### 18f. Mask 3 measured: the block set is a genuine optimum in BOTH directions
+
+`sol_hb.cpp` at mask 3 was submitted as **387284805** and scored **16105.560, -3.703**.  Set against
+18d's mask 0 result, the axis is bracketed and the current value is the peak:
+
+| test | mask 1 (16109.263) | mask 3 = also block P POST | mask 0 = stop blocking D PRE |
+|---|---|---|---|
+| #4 | 795.93 | **-1.05** | **-4.25** |
+| #8 | 830.24 | **-1.97** | **-2.70** |
+| #6 | 385.34 | -0.40 | -0.81 |
+| #16 | 980.65 | -0.22 | +0.11 |
+| #21 | 970.56 | -0.06 | 0.00 |
+| #13 | 730.63 | 0.00 | -0.21 |
+| #10 | 683.25 | 0.00 | -0.04 |
+| **total** | **16109.263** | **-3.703** | **-7.895** |
+
+Both neighbours lose, and they lose on the same tests, so `holdPreToo = 1` is not a fitted constant
+that happens to work -- it is the optimum of a two-sided curve.  The asymmetry is the interesting
+part: letting E run a **D PRE** during a hold costs 7.9, letting it run a **P POST** is worth 3.7.
+Prefill work during the hold is *productive* (it feeds admission, and the hold is long enough to
+absorb it); decode work during the hold competes for the very resource the hold is reserving.
+
+This also kills the heuristic 18d floated.  Local quiet read mask 0 at **+0.128** (judge -7.895, sign
+inverted) but mask 3 at **-0.856** (judge -3.703, sign correct).  The local suites are not
+*anti*-correlated on this axis, they are simply uninformative -- do not "invert" a local reading.
+
+### 18g. `CF_WAIT_R` 14 -> 128: exactly 0.000, the D PROC budget is closed for good
+
+`sol_wr128.cpp` (submission **387286019**) scored **16109.263**, identical to the baseline.  The
+remote-side merge budget was already measured at 0.000 for 4 -> 14 (387246342); 14 -> 128 confirms
+it never binds anywhere on the judge at any magnitude.  quiet had shown the exact signature that
+paid off on `waitPost` -- 14, 32 and 128 byte-identical while 1 does move it -- so **that signature
+alone is not evidence a knob is live on the judge.**  What made `waitPost` different was a *judge*
+measurement at the bottom end (`CF_WAIT_P=1`, -104.0, 387266525) proving the knob had real authority
+over real tests.  Require that before spending slots climbing a locally-invisible ladder.
+
+### 18h. Everything else in the parameter space, swept on the calibrated instrument
+
+| knob | range | quiet | verdict |
+|---|---|---|---|
+| `CF_POOL` | 2, 4, 8, 16, 32 | 735.0 -> 739.2 | monotonic towards the default (1e9). Note `prefillUrgent` is therefore ALWAYS true, so **`ordDecode` is dead code** -- every order experiment has really been on `ordAdmit`. |
+| `CF_TPOTM` | 0, 0.3, 0.95, 2, 10 | byte-identical | inert |
+| `CF_LFF` | 0, 0.5 | byte-identical | inert |
+| `CF_JITR` | 1, 4 | -0.01, -0.00 | inert |
+| `CF_JITL` | 0, 8, 64 | 739.25, 739.10, 739.00 | at the peak |
+| `CF_JITM` | 0 | +0.012 | noise |
+| `CF_JITS` | 1, 12 | -0.10, +0.08 | noise |
+| `CF_TDRG` | 0.2, 0.9 | -0.03, **-10.1** | at the peak |
+| `CF_RBW` | 0, 4 | -0.56, -0.07 | at the peak |
+| `CF_ORDW` | 0.4 | -2.04 | at the peak |
+| `CF_ARRE` | 1 | +0.02 | noise |
+| `CF_SWAP` | 0, 0.5 | -1.29, -0.65 | at the peak |
+| `CF_DTOL` | 0.12, 0.2, 0.3, 0.5 | +0.03, **+0.24**, -0.23, -1.57 | a **spike** at 0.2, not a plateau -- rejected under rule 4 |
+| `CF_WARM` | 0, 2, 5, 10, 20, 40, 70 | +0.41, +0.41, **+0.63**, **+0.63**, 0, 0, 0 | a genuine plateau at 5-10 -- the only survivor |
+
+`warmUp` 100 -> 8 (`sol_w8.cpp`) is the single positive left: quiet **+0.626** and `judge/` all-40
+**+0.314**, against `tests/` -0.14, `hold/` -0.24, `val/` -0.33 and loud -0.11.  On quiet it is three
+tests -- j_34 **+19.9**, j_61 **+4.9**, j_48 **-10.4**.  It wins on both instruments that have ever
+predicted the judge and loses ~0.2 on the three legacy suites, which is the trade CLAUDE.md's score
+order explicitly prefers.
+
+
+## 19. The ceiling audit: where the remaining headroom actually is, and why it is not reachable
+
+`warmUp` 100 -> 8 (`sol_w8.cpp`, submission **387287360**) scored **16109.263, exactly 0.000**, all 22
+byte-identical -- despite being the *only* knob in the whole sweep that was positive on both
+calibrated instruments (quiet +0.626, `judge/` all-40 +0.314).  That is the eighth judge-neutral or
+negative result from parameter work in a row.  **The parameter space is finished.**  For the record,
+the admission order was also searched exhaustively: all 24 permutations of `CF_ORD_A`, and the
+default `1302` is the best of them on quiet (next best `0132` at -0.02, forced `3102` at -2.57).
+
+So this section audits the *structure* instead, using `analyze.exe`'s per-instance ceiling against
+the achieved score on all 40 `judge/` instances.  Nominal total headroom is **4141 points, 103.5 per
+test** -- which looks enormous until each case is opened, at which point it evaporates.
+
+| instance | score | ceiling | nominal gap | what it really is |
+|---|---|---|---|---|
+| j_57 | 418.2 | 1000.0 | **581.8** | unavoidable (below) |
+| j_60 | 559.7 | 956.3 | 396.6 | same shape: `u`=12.7 ms/token, links 78 % |
+| j_66 | 453.6 | 476.4 | **22.8** | ceiling is honest here -- we are at **95.2 %** of it |
+
+**j_66 is the calibration.** `analyze` reports `tp <= 0.182189` against `tp_UB = 0.353556`: the
+instance's own latency floor caps throughput at **52 % of the tpUB the scorer measures against**, so
+`tpComp` can never exceed 0.476 no matter what any policy does.  We reach 0.4536.  The same holds for
+the judge's #6, which has the same signature (`w_tp >= 0.75`, small R, `tpComp` low): **its 385.3 is
+not 615 points of headroom, it is close to that instance's ceiling.**  `-stats` on j_66 shows E at
+**95.5 %** utilisation with links at 1.8 %, decode groups at 3.9 and `Cdec = 37.27` of which `3S`
+is 28.4 -- three schedule costs per token is structural, and the live population `L ~ 7.6` is fixed
+by the arrival spread.  `rate = min(L/C(m), Ecap(m))` and both terms are binding at m = 3.9, i.e.
+`retarget()` is sitting exactly on the crossing point.  There is nothing to win.
+
+**j_57 is where the ceiling lies, and the arithmetic is exact.** K=4, R=12, `u = 652.8 ms per token
+of transfer`, so request 0 (`arrive 4977, L_in 2600`) needs an uplink transfer of **1,697,386 ms** --
+and it is the only request in the system until t = 12065.  Nothing can be held (holding with nothing
+in flight is a stuck state), so it must be released, and the downlink cannot deliver anything until
+it lands.  Achieved elapsed 6.216e6 against a work floor of 4.503e6: the gap is **1.713e6, which is
+that first upload (1.697e6) to three digits.**  `analyze`'s 1000.0 ignores exactly this flow-shop
+structure -- rule 3 in CLAUDE.md, confirmed a third time.
+
+Two structural ideas were built and killed against this instance:
+
+* **Decode-tail admission order** (`sol_tail.cpp`, deleted).  Makespan is
+  `max_i(prefill_finish_i + L_out_i * C_dec)`, so pure SJF on `tdrCost` -- which rises with `L_in`
+  and is *independent of* `L_out` -- looks like it should systematically strand the long pole.  It
+  cannot be implemented and would not help if it could: **`L_out` is never revealed to the
+  solution.** Only `L_in` arrives with the request (`lin_[i] = e.b`); the solution learns a request's
+  length only when it stops producing tokens.  With `L_out` i.i.d. and unknown, every request has the
+  same expected tail, so every admission order leaves the same expected tail after the last prefill,
+  and SJF's waiting win is free.  **This closes the whole "schedule by remaining work" family.**
+* **Prefill-vs-decode arbitration on the downlink** (`sol_jd.cpp`, `CF_JITD`).  A decode result is
+  `lat + u*1` and a prefill result is `lat + u*L_in`; a decode result stuck behind one big prefill
+  result stalls that request's entire serial token loop, and j_57's uplink does idle for 1.5e6 ms in
+  a single block at the tail.  `jitProc` already reorders the last P PROC chunk against shorter
+  *prefills*, so this extends the same look-ahead to decode work.  Mode 1 (gated on a D PROC actually
+  running, via `nextDownAfterProc`) never fires -- the remote stage is instantaneous next to the
+  transfers.  Mode 2 (any live decode, gated on a size ratio) fires and **loses**: j_57 goes
+  418.16 -> 388.17, elapsed 6.216e6 -> 6.292e6, TDR and TPOT both up.  The reason is that the
+  downlink's total work is fixed, so reordering cannot reduce it -- delaying a prefill result just
+  idles the bottleneck and pushes everything later.  Quiet is byte-identical, loud -0.02.
+
+**Conclusion.** On the two instance families that carry all the nominal headroom -- E-bound with a
+small live population, and transfer-bound with one huge prefill -- the achieved schedule is within a
+few percent of what the instance physically permits, and the residual is head-of-line delay that no
+online policy can avoid.  16109.263 is at or very near this architecture's ceiling.

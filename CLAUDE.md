@@ -9,30 +9,48 @@ This file is the operational guide: status, commands, and the rules that were le
 
 ## Status
 
-Best score **16109.263** (submission **#387270011**), all 22 tests OK. Rank-50 cutoff is
-**16153.093**, so the gap is **43.8** and closing. Rank 1 is 16430.623.
+Best score **16109.263** (submission **#387270011**), all 22 tests OK. **Rank 76.** The rank-50
+cutoff has risen to **16166.452** (`pavement`), so the gap is **57.2 and widening** as others
+improve. Rank 1 is 16430.623.
 
 `sol.cpp` = `sol_best_16109.cpp` = the old policy with **`CF_WAIT_P` (the D POST merge-hold budget)
-8.0 -> 32.0**. Nothing else changed. This session took 16072.540 -> 16109.263 (**+36.7**) entirely
-on that one constant.
+8.0 -> 32.0**. Nothing else changed; that one constant is the whole of the last +36.7.
 
-**START HERE NEXT SESSION.** The gradient is still climbing and is *accelerating*; every step so far
-moved test **#19** and nothing else. Probes are prepared, verified (C++17/20/23, zero failures on
-edge/ tests/ hold/ val/ judge/, protocheck 8/8) and ready to upload **in this order**:
+**START HERE NEXT SESSION.** Do **not** resume knob work. Nine consecutive judge probes have now
+returned 0.000 or negative, the parameter space has been searched exhaustively (NOTES §18h, §19),
+and a ceiling audit of the two instance families that carry all the nominal headroom says the
+achieved schedule is within a few percent of what those instances physically permit (NOTES §19).
+Anything that moves the score from here has to change the *architecture*, not tune it.
 
-| file | change | expectation |
-|---|---|---|
-| `sol_p128.cpp` | `waitPost` 32 -> 128 | next step; #19 has 87.9 points left |
-| `sol_p512.cpp` | `waitPost` 32 -> 512 | if 128 still gains, find the far end |
-| `sol_hc32.cpp` | `holdCap` 4 -> 32 on the 32 base | the OTHER cap on total hold time |
+### Everything measured on the judge since 16109.263 — all dead
 
-Upload the variant file directly and keep `sol.cpp` pinned to the confirmed best, so a losing or
-dropped probe cannot lose the record of what actually scores. Confirm every submission on
-`/contest/2251/my` — the judge takes ~1 per 9 minutes and silently drops the rest.
+| probe | change | judge | reading |
+|---|---|---|---|
+| `sol_p128` #387281899 | `waitPost` 32 -> 128 | **0.000**, byte-identical | budget saturated; `holdCap` also proven non-binding, since both hold tests scale with it |
+| `sol_hp0` #387282957 | stop blocking D PRE during a D POST hold | **-7.895** | #4 -4.3, #8 -2.7, #6 -0.8, #13, #10 |
+| `sol_hb` #387284805 | *also* block P POST during the hold | **-3.703** | #4 -1.1, #8 -2.0, #6 -0.4 |
+| `sol_wr128` #387286019 | `waitProc` 14 -> 128 | **0.000** | the D PROC budget never binds at any magnitude |
+| `sol_w8` #387287360 | `warmUp` 100 -> 8 | **0.000** | the only knob positive on BOTH calibrated instruments (quiet +0.63, `judge/` +0.31) — and still nothing |
 
-**Do not consult the local suites on this axis.** They report `waitPost` 16, 32 and 64 as
-byte-identical: the budget stops binding locally above 16, so no local instrument can see the
-gradient at all, and at the bottom end they called the -104.0 change an improvement.
+The two hold results bracket `holdPreToo = 1` from both sides, so the block set is a genuine
+optimum, not a fitted constant. `sol_p512.cpp` and `sol_hc32.cpp` are **dead — do not submit them**;
+the `p128` identity proves neither constant can move a point.
+
+### The two local instruments are now both discredited on this policy
+
+`tmp/quiet.list` was calibrated to 13x better L1 than the full `judge/` suite, and it still called
+`sol_w8` +0.63 against a judge 0.000 and `sol_hp0` +0.13 against a judge **-7.9**. It is not
+*anti*-correlated either (it got `sol_hb`'s sign right), so it cannot be inverted — it is simply
+uninformative about anything that depends on a *long* hold, because locally the budget never binds
+and holds are always short. Keep using it as a **regression guard only**.
+
+### What is architecturally closed (do not rebuild any of these)
+
+Rollout (§14), placement (§15), prefill pacing (§15), wave-shape smoothing (§18c), raising `mStar`
+under TPOT slack (§18b — the rate model is *right* to stop where it does), the hold block set
+(§18d/f), both merge budgets (§18a/g), admission order (all 24 permutations searched), and now
+**schedule-by-remaining-work in any form: `L_out` is never revealed to the solution** (§19), so no
+policy can know a request's decode tail until it ends.
 
 ## Where the +36.7 came from
 
@@ -70,40 +88,36 @@ Codeforces keeps the **best** submission, so experiments are free and **anything
 **Per-test now:** `500, 500, 500.6, 795.9, 487.3, 385.3, 907.5, 830.2, 736, 683.3, 500.2, 799.9,
 730.6, 415.3, 716.6, 980.7, 888.2, 915.7, 912.1, 998.2, 970.6, 955.2`.
 
-## The merge-batching axis is live — work it with judge probes, one per ~9 min
+## The merge-batching axis is CLOSED
 
-Four judge measurements now bracket it:
+Six judge measurements bracket the D POST hold's budget, and it is saturated:
 
 | probe | judge total | what moved |
 |---|---|---|
 | `CF_WAIT_P=1` | 15968.542 (**-104.0**) | #5 -70.8, #8 -19.5, #4 -14.0, #16 -8.4, #6 +5.8, #13 +3.0 |
 | `CF_WAIT_P=8` | 16072.540 | the old default |
-| `CF_WAIT_P=16` | **16077.404** (+4.9) | #19 +4.8, other 21 byte-identical |
-| `CF_EBW=16` (clamp released) | 16077.404 (**0.000**) | nothing — the clamp never binds |
-| `mStar = L` (`sol_mall.cpp`) | 16062.24 (**-15.2**) | **#7 -14.6**, #6 -0.5, #5 +0.1 |
+| `CF_WAIT_P=16` | 16077.404 (+4.9) | #19 +4.8 |
+| **`CF_WAIT_P=32`** | **16109.263** (+31.9) | #19 880.2 -> 912.1 |
+| `CF_WAIT_P=128` | 16109.263 (**0.000**) | nothing — byte-identical, the budget no longer binds |
+| `CF_EBW=16` | 16077.404 (0.000) | the E-bottleneck clamp never binds |
+| `mStar = L` | 16062.24 (-15.2) | **#7 -14.6** |
 
-**Test #7 is the constraint on this axis.** It is also the test the first-token deferral cost 13.2.
-Both changes delay a token that was already ready, so #7 is TPOT-critical — while #19 pays for
-exactly the opposite. Any further batching has to be *conditional on TPOT slack*, not uniform.
+The remaining cap is `mStar`, and raising it is refuted twice over: `mStar = L` costs 14.6 on #7, and
+a TPOT-slack-gated version reads -1.5 on quiet with j_36 -20 and j_34 -16. The reason is structural,
+not tuning — `waveRate`'s own-round-trip term is `L/C`, and with `L` requests live each emits one
+token per cycle **regardless of m**, so merging past the model's optimum lengthens `C` without
+raising `L`. The rate model is right to stop where it does. See NOTES §18b.
 
-So the merge hold's **budget** is now slack: `waitPost` 16 and 32 are byte-identical on every local
-suite, `holdCap` 4 and 16 likewise, and `eBottleW` is measured inert on the judge. What still caps a
-decode group is **`mStar`** — the hold only fires `while ((int)qDPost.size() < mStar)`.
+**Test fingerprint from these probes** (useful for reading any future result):
 
-Ready to submit, each building under C++17/20/23 with **zero failures across every suite**:
+* **#19** responds to the *budget* and nothing else.
+* **#4, #6, #8, #10, #13, #16** respond to the hold's *block set* and not to the budget.
+* **#5** owns the budget only at the bottom end (-70.8 if cut to break-even); saturated by 8.
+* **#7** is indifferent to the budget but TPOT-critical: -13.2 from the first-token deferral,
+  -14.6 from `mStar = L`. Never delay an already-ready token for it.
+* **#14** has still never moved, now under 31 submissions.
 
-| file | change | local `judge/` |
-|---|---|---|
-| `sol_tb.cpp` | `CF_TPOTB=1` — **replace** the fitted budget with the measured TPOT slack `SLO2 - tpotNow()`, floored at one merge saving. Grows the hold where SLO2 is loose (what #19 pays for) and shrinks it to break-even where TPOT is tight (what #7 needs). | 712.65 (+0.42) |
-| `sol_p32.cpp` | `waitPost` 16 -> 32 | 712.21 (-0.01) |
-| `sol_hc16.cpp` | `holdCap` 4 -> 16 | 712.22 (byte-identical) |
-
-**A negative local number here is not a reason to skip a probe.** On this axis the local suites have
-now been measured backwards twice in both directions. Upload the variant file directly — keep
-`sol.cpp` pinned to the confirmed best (`sol_best_16077.cpp`) so a dropped or losing probe cannot
-lose the record of what actually scores.
-
-## Score on `tmp/quiet.list`, not on all of `judge/` — this is the headline change
+## Score on `tmp/quiet.list`, not on all of `judge/` — but see the caveat at the top
 
 Seven judge-measured changes are all reproducible locally as knob flips, so the two instruments can
 be compared **per change**. The judge's 22 tests never move by more than ~1 point per test under any
@@ -121,7 +135,12 @@ sh score.sh sol_x.cpp "$(cat tmp/quiet.list | tr '\n' ' ')"     # THE instrument
 sh score.sh sol_x.cpp "$(cat tmp/loud.list  | tr '\n' ' ')"     # only a "did I break it" guard
 ```
 
-Baseline: quiet **740.560**, loud **675.657**. Regenerate both from `tmp/deltamat.txt` if the
+Baseline for the CURRENT `sol.cpp` (waitPost 32): quiet **739.248**, loud **675.634**.
+(The 740.560/675.657 pair was the waitPost-8 baseline.)
+
+**Caveat added later:** this instrument was calibrated against seven changes that all bind locally.
+It is uninformative about anything that depends on a *long* hold, and it has since called
+`sol_w8` +0.63 (judge 0.000) and `sol_hp0` +0.13 (judge **-7.9**). Regression guard, not oracle. Regenerate both from `tmp/deltamat.txt` if the
 battery is ever re-run.
 
 **On the quiet subset every tunable in the policy is flat within ±0.4 per test** — the only knob
@@ -129,21 +148,16 @@ worth more is `CF_JITP=0` at -19.0, which is just the already-paid-for P PRE hol
 is monotonically worse, decode-first on remotes is -0.09, and the placement refinements are exactly
 0.000. Treat the parameter space as exhausted; only structural changes are worth a submission.
 
-## `CF_WAIT_R` 4 → 14: submitted, **exactly 0.000** on the judge
+## `CF_WAIT_R`: closed at every magnitude
 
-`sol_wr.cpp` (`waitProc` default `4.0 → 14.0`) was submitted as **#387246342** and scored
-**16072.540 — all 22 per-test values byte-identical to #387210572, to 10 decimal places.** The
-merge hold's budget never binds differently on any judge test, exactly as it never binds on the
-small-`R` slice. Promoted into `sol.cpp` anyway, on the same insurance logic as the TDR-worth-it
-guard: `judge/` **710.728 → 712.976** from **2 winners and zero losers** (`j_53` +76.5, `j_36`
-+13.2), a 12–16 plateau, zero failures anywhere, and no measurable cost on the live set.
+`waitProc` 4 -> 14 scored **exactly 0.000** (#387246342) and 14 -> 128 scored **exactly 0.000** again
+(#387286019, `sol_wr128.cpp`). The remote-side merge budget never binds anywhere on the judge.
 
-**This is the sixth judge-neutral-or-negative result in a row from knob tuning.** The judge's 22
-tests do not exercise the regimes the local suites disagree over. See "Next idea" below — rollout
-is the only remaining lever in a different class.
-
-Also last session: NOTES.md §12 — extending the merge look-ahead to *ready* (not just *running*)
-work is a real blind spot whose every exposed wait is past the merge break-even. Dead as a class.
+This matters as a *method* lesson. quiet showed `CF_WAIT_R` 14, 32 and 128 byte-identical while 1 did
+move it — the exact signature that paid off on `waitPost`. **That signature alone is not evidence a
+knob is live.** What made `waitPost` different was a judge measurement at the bottom end
+(`CF_WAIT_P=1`, -104.0, #387266525) proving the knob had real authority over real tests. Require a
+judge-side bottom-end measurement before spending slots climbing a locally-invisible ladder.
 
 ## THE bug — never reintroduce it
 
@@ -291,34 +305,29 @@ in flight, so a stuck state is impossible.
 
 Tunables are `getenv`-overridable (`CF_*`) for sweeping; **defaults are what the judge runs.**
 
-## Next idea — NOT rollout. That family is now bounded and closed. See NOTES.md §14.
+## Next idea — there is no parametric one left. See NOTES §18h and §19.
 
-**Do not build rollout.** It was already built once (`sol_v9_x.cpp`, `Roll::`, +0.15 on `judge/`),
-and this session measured the *ceiling* rather than another implementation. `sol_hc3.cpp` +
-`tmp/hc3.py` hill climb an **oracle with perfect hindsight** over the local computer's per-frame
-choice — an upper bound on any online policy for that family, rollout included. Exhaustive over
-every frame it is worth **+4 to +7 per test on `judge/`**, i.e. **~+9 to +15 across the real 22**,
-against a **74.2**-point gap. The headroom rollout was designed to capture was already harvested by
-the P PRE JIT release (j_46 +41.6 → +1.85). §14a then implemented the one residual shape the oracle
-found that was not already refuted, and it measured **−0.28 on the very test that motivated it**.
+Every knob has been swept on the calibrated instrument and every survivor has been submitted; the
+last nine judge probes returned 0.000 or negative. Before touching anything, read the rejected-ideas
+tables in `NOTES.md` §5, §10, §14, §15, §16, §18 and §19 — the list of closed families is long and
+several were closed twice.
 
-**Those families are now measured too** (NOTES §15). The exhaustive placement oracle (`sol_hp.cpp` +
-`tmp/hp.py`, every request × every remote, hill climbed to convergence) finds +0 to +15 per test, but
-its `j_48` trace shows the wins are mostly *relabelling* — `was=0 now=1` with both remotes still
-empty, which only reorders the uplink FIFO. Pricing the `dStar` veto on opening a fresh remote
-(`sol_op.cpp`, `CF_OPEN`) and both placement-cost refinements (`sol_pc.cpp`, `CF_DECL` / `CF_DECR`)
-are **exactly 0.000 on `tmp/quiet.list`**. Prefill pacing is dead outright: ungating the P PRE hold
-moves throughput by ±0.005 on every test while destroying waiting.
+**The ceiling audit (NOTES §19) is the important part.** `analyze.exe` reports 4141 points of
+nominal headroom across the 40 `judge/` instances, 103.5 per test, and it is almost entirely an
+artefact:
 
-Before retrying anything else, read the rejected-ideas tables in `NOTES.md` §5, §10, §14, §15, §16.
+* **j_66** (the closest analogue of judge #6): ceiling 476.4, achieved **453.6 = 95.2 %**. Its own
+  latency floor caps `tp` at 0.182 against a `tp_UB` of 0.354, so `tpComp` can never exceed 0.476.
+  E runs at **95.5 %** utilisation, `Cdec = 37.27` of which `3S = 28.4`, and `retarget()` sits exactly
+  on the crossing point of the two binding terms. **#6's 385.3 is not 615 points of headroom.**
+* **j_57** (ceiling 1000, achieved 418.2): `u = 652.8 ms per token`, and request 0 arrives *alone* at
+  t=4977 with `L_in = 2600` — a **1,697,386 ms** uplink transfer that must be released (holding with
+  nothing in flight is a stuck state) and behind which the downlink can deliver nothing. Achieved
+  elapsed exceeds the work floor by **1.713e6, which is that transfer to three digits.**
 
-**What is actually left.** On `tmp/quiet.list` the headroom against the (optimistic) work floor is
-+28.5 per test, concentrated in `j_48` +163, `j_67` +128, `j_68` +111, `j_32` +80. The new
-per-computer idle accounting says those tests idle **every resource simultaneously** in repeated
-400–600 ms blocks — a latency-bound closed loop with too few live requests, not a contended one.
-There is nothing to re-order there, which is why no knob touches them. Any further gain has to come
-from a change that raises decode concurrency on a latency-bound instance, or the work floor is
-simply unreachable and 16072.540 is close to this architecture's ceiling.
+So the remaining gap is head-of-line delay no online policy can avoid. If a future session wants to
+move the number, it needs a different architecture, not a better-tuned one — and it should first
+reproduce the two audits above to confirm that conclusion rather than take it on trust.
 
 ## The one rule this round added
 
