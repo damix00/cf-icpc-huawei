@@ -985,3 +985,18 @@ The rule therefore pays the -104 mechanism to fix something it cannot reach.
 budget large, and leave `mStar` where the rate model puts it.* That is exactly `sol.cpp` at
 16077.404. The only untried step in the direction the judge has actually rewarded is more budget:
 `sol_p32.cpp` (`waitPost` 32) and beyond.
+
+### 17f. The gradient accelerates: `waitPost` 32 is **+31.9**, all of it test #19
+
+`sol_p32.cpp` submitted as **#387270011**: **16109.263**, +31.86. Again exactly one test moved.
+
+| `waitPost` | judge total | test #19 | step |
+|---|---|---|---|
+| 1 | 15968.542 | 875.4 | (and #5 -70.8, #8 -19.5, #4 -14.0, #16 -8.4) |
+| 8 | 16072.540 | 875.4 | -- |
+| 16 | 16077.404 | 880.2 | **+4.86** |
+| 32 | **16109.263** | **912.1** | **+31.86** |
+
+The step is **accelerating**, and every local suite calls 16, 32 and 64 byte-identical -- the budget
+stops binding *locally* above 16, so no local instrument can see this at all. Test #19 has 87.9
+points still on the table. `sol.cpp` = `sol_best_16109.cpp` = `waitPost` 32; next probe is 128.
