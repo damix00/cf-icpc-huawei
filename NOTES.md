@@ -911,3 +911,28 @@ raise `mStar` or `holdCap`, not the ones that lengthen the budget:
   rather than by a multiple of the merge saving. This is the structural form of what the gradient is
   paying for: the hold's real cost is the TPOT it spends, the score only charges for the part above
   SLO2, and both terms are known online.
+
+### 17c. `mStar = L` is -15.2, and all of it is test #7
+
+`sol_mall.cpp` (`mStar = max(mStar, L)`, i.e. target the whole live decode population) submitted as
+**#387268716**: **16062.24**, -15.16 from the best.
+
+| test | best | `mall` | delta |
+|---|---|---|---|
+| #7 | 907.5 | 892.9 | **-14.6** |
+| #6 | 385.3 | 384.8 | -0.5 |
+| #5 | 487.3 | 487.4 | +0.1 |
+| #20 | 998.2 | 998.1 | -0.1 |
+| #19 | 880.2 | 880.2 | (keeps the `CF_WAIT_P=16` gain) |
+
+**Test #7 is the constraint on this whole axis.** It is the same test that lost 13.2 to the
+first-token deferral (NOTES 15). Both changes do the same thing to it -- delay a token that was
+ready -- so #7 is TPOT-critical, while #19 rewards exactly the opposite. The rate model's `mStar`
+already sits between them; raising it uniformly buys #19 nothing it has not already got from the
+budget and hands #7 the whole loss.
+
+That is precisely the conflict `sol_tb.cpp` is built to resolve: budget the merge holds by the
+**measured TPOT slack** (`SLO2 - tpotNow()`) instead of by a multiple of the merge saving, so the
+hold shrinks by itself on a test whose TPOT is tight and grows where it is loose. Both terms are
+known online, and `excess_tpot` is clamped at zero, so the slack is free to spend and nothing past
+it is.

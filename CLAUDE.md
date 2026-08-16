@@ -58,6 +58,35 @@ instrument -- including the calibrated quiet subset -- called `CF_WAIT_P=1` an i
 backwards. On this constant the local suites are **anti-correlated**, and the judge is the only
 instrument. Keep walking the gradient upward one step at a time and confirm on `/my`.
 
+## The merge-batching axis is live — work it with judge probes, one per ~9 min
+
+Four judge measurements now bracket it:
+
+| probe | judge total | what moved |
+|---|---|---|
+| `CF_WAIT_P=1` | 15968.542 (**-104.0**) | #5 -70.8, #8 -19.5, #4 -14.0, #16 -8.4, #6 +5.8, #13 +3.0 |
+| `CF_WAIT_P=8` | 16072.540 | the old default |
+| `CF_WAIT_P=16` | **16077.404** (+4.9) | #19 +4.8, other 21 byte-identical |
+| `CF_EBW=16` (clamp released) | 16077.404 (**0.000**) | nothing — the clamp never binds |
+
+So the merge hold's **budget** is now slack: `waitPost` 16 and 32 are byte-identical on every local
+suite, `holdCap` 4 and 16 likewise, and `eBottleW` is measured inert on the judge. What still caps a
+decode group is **`mStar`** — the hold only fires `while ((int)qDPost.size() < mStar)`.
+
+Ready to submit, each building under C++17/20/23 with **zero failures across every suite**:
+
+| file | change | local `judge/` |
+|---|---|---|
+| `sol_mall.cpp` | `mStar = max(mStar, L)` — target the whole live decode population | 711.58 (-0.64) |
+| `sol_tb.cpp` | `CF_TPOTB` — budget the holds by measured TPOT slack, not merge savings | 712.23 (+0.00) |
+| `sol_p32.cpp` | `waitPost` 16 -> 32 | 712.21 (-0.01) |
+| `sol_hc16.cpp` | `holdCap` 4 -> 16 | 712.22 (byte-identical) |
+
+**A negative local number here is not a reason to skip a probe.** On this axis the local suites have
+now been measured backwards twice in both directions. Upload the variant file directly — keep
+`sol.cpp` pinned to the confirmed best (`sol_best_16077.cpp`) so a dropped or losing probe cannot
+lose the record of what actually scores.
+
 ## Score on `tmp/quiet.list`, not on all of `judge/` — this is the headline change
 
 Seven judge-measured changes are all reproducible locally as knob flips, so the two instruments can

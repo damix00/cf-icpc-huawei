@@ -424,7 +424,7 @@ void schedInit(const Params& p, const Table& t) {
     // and it costs nothing anywhere: small-R is byte-identical (the hold never fires there),
     // tests/ +0.13, val/ +0.09, hold/ -0.12, edge/ unchanged.  The gain is 2 tests, 0 losers.
     waitProc = envD("CF_WAIT_R", 14.0);
-    tpotBudget = envD("CF_TPOTB", 0.0);
+    tpotBudget = envD("CF_TPOTB", 0.5);
     warmUp = envD("CF_WARM", 100.0);
     dTol = envD("CF_DTOL", 0.04);
     linkFixedFrac = envD("CF_LFF", 0.05);
