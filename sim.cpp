@@ -9,9 +9,12 @@
 // task times, single-server FIFO UP/DOWN links, and the 0..1000 score formula.
 #define LOCAL_SIM
 // Which strategy source to link against; override to score a variant side by side:
-//   g++ -O2 -std=gnu++17 -DSOL_SRC=\"sol_v2.cpp\" -o sim_v2.exe sim.cpp
+//   g++ -O2 -std=gnu++17 -DSOL_SRC=\"claude/sol.cpp\" -o sim_x.exe sim.cpp
+// The default is the frozen 16109.263 reference (ref.cpp) so that -calibrate and the mk*.sh
+// generators always use one fixed schedule, independent of whatever either agent is editing.
+// Paths are resolved relative to sim.cpp's directory, i.e. the repo root.
 #ifndef SOL_SRC
-#define SOL_SRC "sol.cpp"
+#define SOL_SRC "ref.cpp"
 #endif
 #include SOL_SRC
 

@@ -1285,3 +1285,131 @@ loud -4.65; it is the last untested direction on this axis.
 `sol_p128` 0.000, `sol_hp0` -7.895, `sol_hb` -3.703, `sol_wr128` 0.000, `sol_w8` 0.000,
 `sol_hpb` -48.83, `sol_cf` -17.44, `sol_dn` -0.246.  Best remains **16109.263 (#387270011)**, rank
 **76**, with the rank-50 cutoff now **16166.452** and rising.
+
+
+## 21. SimSelect: the solution carries an exact model of its own environment and picks its policy
+
+New architecture. `claude/sol.cpp` = the 16109.263 policy refactored off file-scope globals into a
+clonable `Sched`, plus an **exact internal simulator** and a **selector** that forks the live
+scheduler mid-run, simulates the remainder under ~40 candidate policy vectors, and adopts the best.
+`CF_SEL=0` is byte-identical to `ref.cpp` on all 183 local instances, so the fallback is the shipped
+16109.263 behaviour exactly.
+
+### Why: every global constant is a compromise between tests that disagree
+
+`claude/tmp/oracle.py` sweeps ~40 policy vectors over every instance and reports the mean of the
+per-instance argmax:
+
+| suite | default | best single fixed theta | **per-instance oracle** | gap only per-instance choice can reach |
+|---|---|---|---|---|
+| `judge/` (40) | 712.212 | 716.001 (`defer2`, +3.79) | **724.444 (+12.23)** | **+8.44** |
+| `hold/` (54) | 841.165 | 845.376 (`dtol0.5`, +4.21) | **862.215 (+21.05)** | **+16.84** |
+| `val/` (36) | 843.674 | 846.420 (`ord3012`, +2.75) | **854.791 (+11.12)** | **+8.37** |
+
+30 of the 40 `judge/` instances prefer a non-default theta and the picks are diverse (base x10,
+defer2 x5, ord1320 x4, wp1 x3, ...). `wp1` -- the setting that cost **-104.0** on the real judge when
+shipped globally -- is still the single best policy on three of them. That is the whole thesis: the
+choice belongs to the instance, not to the constant.
+
+### The unlock: `tp_base` reveals the hidden total output-token count
+
+NOTES 19 closed the "schedule by remaining work" family on the grounds that `L_out` is never
+revealed. **The total is.** `tp_base` is handed to us at startup and is by definition the throughput
+of the *reference* schedule, which the statement fixes as strictly one request at a time, whole
+prefill piece, decode groups of 1. Its makespan is a known function of the arrivals, the `L_in`
+values (both observed) and the single unknown `T = sum(L_out)`:
+
+```
+fin = max(fin, arr[i]) + prefillPath(L_in[i]) + L_out[i]*Cdec ,   tp_base = T / (fin - arr[0])
+```
+
+monotone in `T`, so bisection inverts it. Measured by `claude/tmp/infer.py` over all 158 local
+instances: **median error 0.000 %, within 1 % on 153 of them.** Dividing through by `R` also gives
+the *mean* output length from the *mean* prefill path, which any prefix of arrivals estimates
+(`claude/tmp/infer2.py`) -- exact once arrivals stop, noisy before, and that distinction is what the
+selector gates on.
+
+### The internal simulator is exact, and proving it mattered
+
+`CF_TRUTH=<testfile>` (diagnostic only) hands the projection the real instance. With it the
+predicted final score equals the actual to every printed digit -- `j_45` 726.455/726.455, `j_34`
+604.724/604.724, `j_40` 599.476/599.476 -- at every checkpoint. That isolates the error source: the
+engine is exact, so everything left is belief. Running the same selector on a *perfect* belief has
+**zero losers**, which is what made it worth fixing the belief rather than the mechanism.
+
+The check also caught a real bug: the fork is taken between ingest and decide, so the clone still
+owes the current frame's decision. Without replaying it the simulation skipped a dispatch and
+deadlocked outright whenever nothing happened to be in flight.
+
+### Four gates, each bought with a measured failure
+
+* **Trigger on frames, not only tokens.** `h_4_15` emits its 4th token at t=135910 of a 141200 ms
+  run; a token-triggered selector arrives after every placement decision is already made. Adding a
+  frame trigger took `hold/` from +1.3 to +15.0 (`h_4_15` **+181.3**, `h_4_16` **+129.9**).
+* **A switch needs enough observed.** With two arrivals in hand the simulated instance is a stub.
+  `j_47` ran `jitp0` through its whole admission window on such a ranking and lost 42.6. Requiring
+  `arrivals done || n >= 8` turns that into **+60.9**. `CF_SELMA` 4..12 is **byte-identical** -- a
+  plateau, not a spike.
+* **Converge, don't track.** A policy that is the better *continuation* can still produce a worse
+  run than either pure policy, because the schedule it inherits was built by the other one. `j_47`
+  picked the oracle's own theta early, reverted at t=246436 on an accurate prediction, and finished
+  below both. `CF_SELFZ` 4..8 is a plateau; 5 is the centre.
+* **An incomplete round may not decide.** When the budget truncates a round the slow-to-simulate
+  candidates drop out, and which those are has nothing to do with which is best -- worth **-107.6**
+  on one `hold/` instance before the completeness guard.
+
+### Result
+
+| suite | ref.cpp | SimSelect | delta | improved / worse | worst loss |
+|---|---|---|---|---|---|
+| `judge/` (40) | 712.212 | **719.398** | **+7.19** (59 % of oracle) | 17 / 2 | -4.1 |
+| `tests/` (28) | 831.008 | **836.119** | **+5.11** | | |
+| `hold/` (54) | 841.165 | **853.125** | **+11.96** (57 %) | 17 / 2 | -3.2 |
+| `val/` (36) | 843.674 | **849.246** | **+5.57** (50 %) | 10 / 2 | -1.0 |
+| `edge/` (23) | 290.419 | 290.418 | -0.001 | | |
+
+Zero failures on every suite; builds under C++17/20/23; protocheck 8/8; pipecheck 28/28;
+deterministic across repeated runs. Every suite beats the best *fixed* policy by 2-3x, and the wins
+are spread across many instances rather than concentrated in the volatile ones -- a healthier shape
+than anything in sections 16-20.
+
+**The 65535-character trap.** Codeforces rejects sources over 65535 characters, and the submit form
+fails *silently* through the UI -- the error is only in the page DOM ("Field should contain no more
+than 65535 characters"). `claude/sol.cpp` is 82 KB of documented master; `claude/tmp/strip.py`
+produces the literal-aware comment-stripped `claude/sol_submit.cpp` (58 843 chars), verified
+byte-identical in behaviour on all 183 instances. **Always check the DOM for an error after
+clicking submit; a silent no-op is not a rate limit.**
+
+### 21a. Judge result: 16115.479 (#387321232), a new best, and the local instrument is CALIBRATED
+
+**+6.216 over 16109.263.** First positive judge probe in ten. Per test:
+
+| test | 16109.263 | 16115.479 | delta |
+|---|---|---|---|
+| **#6** | 385.3 | **393.22** | **+7.92** |
+| **#7** | 907.5 | **914.79** | **+7.29** |
+| #10 | 683.3 | 684.44 | +1.14 |
+| #12 | 799.9 | 800.51 | +0.61 |
+| #8 | 830.2 | 827.54 | -2.66 |
+| **#13** | 730.6 | 722.62 | **-7.98** |
+| the other 15 | | | 0.00 +-0.05 |
+
+**#6 and #7 both gained.** #7 is the TPOT-critical test that punished every previous change (-13.2
+from the deferral, -14.6 from `mStar = L`); #6 has `w_tp >= 0.75`, is the odd one out on every weight
+gate, and NOTES 19 argued it was near its instance ceiling. They want opposite things, and a
+per-instance choice is the only thing that can give both. #14 still has not moved (32 submissions).
+
+**The ratio is the real news.** `judge/` predicted +7.19/test, the judge delivered +6.22/22 tests --
+about **1.15x**, against the 10x over-prediction and two sign errors that made every local
+instrument untrustworthy in sections 16-20. The reason is structural: those measurements were
+global-knob changes whose `judge/` mean was carried by a handful of hyper-volatile instances the
+real 22 do not contain, whereas SimSelect's gain is spread over 17 of 40 instances with the worst
+loss at -4.1. **Local improvements to this architecture should be expected to transfer near 1:1**,
+which is a measurement loop the repo has never had.
+
+Time 4125 ms on test #17 against the 15 s limit -- the selector budget is being spent, with ~3.6x
+headroom left.
+
+Remaining losses are #13 (-7.98) and #8 (-2.66): instances where the selector switched and the
+prediction was wrong. Capture is ~55 % of the per-instance oracle, so the headroom inside this
+architecture is roughly another +5/test on `judge/`.

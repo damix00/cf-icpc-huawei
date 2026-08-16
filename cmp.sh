@@ -1,12 +1,13 @@
 #!/bin/sh
-# Per-test delta between two scored variants.   ./cmp.sh sol sol_v1
-# Names are the TAGs used by score.sh, i.e. the source basename without .cpp.
+# Per-test delta between two scored variants.   sh cmp.sh ref claude_sol
+# Names are the TAGs used by score.sh: the source path minus .cpp, separators folded to '_'
+# (claude/sol.cpp -> claude_sol).
 #
 # Both tags must have been scored on the SAME suite -- score.sh overwrites tmp/scores_<tag>.txt on
 # every run, so scoring one variant on tests/ and the other on hold/ leaves nothing to join.
 A=${1:-sol}; B=${2:-sol_v1}
 for t in "$A" "$B"; do
-  [ -f "tmp/scores_$t.txt" ] || { echo "no tmp/scores_$t.txt -- run: sh score.sh $t.cpp \"<glob>\"" >&2; exit 2; }
+  [ -f "tmp/scores_$t.txt" ] || { echo "no tmp/scores_$t.txt -- run: sh score.sh <path>.cpp \"<glob>\"" >&2; exit 2; }
 done
 join -j1 \
   <(awk '/score=/{split($0,a,"test=");split(a[2],f," ");split($0,b,"score=");split(b[2],s," ");print f[1],s[1]}' "tmp/scores_$A.txt" | sort) \

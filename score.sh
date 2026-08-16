@@ -1,16 +1,18 @@
 #!/bin/sh
 # Score a strategy source across a test suite and print the mean.
 #
-#   ./score.sh                       # score sol.cpp on tests/
-#   ./score.sh sol_v2.cpp            # score a variant
-#   ./score.sh sol_v2.cpp "tests/g_5_*.txt tests/g_6_*.txt"
-#   STATS=1 ./score.sh sol.cpp       # also print per-test utilisation
+#   ./score.sh                          # score ref.cpp (the frozen 16109.263 baseline) on tests/
+#   ./score.sh claude/sol.cpp           # score a solution
+#   ./score.sh claude/sol.cpp "tests/g_5_*.txt tests/g_6_*.txt"
+#   STATS=1 ./score.sh codex/sol.cpp    # also print per-test utilisation
 #
+# Run from the repo root; the source path is relative to it.  The tag is the path with separators
+# folded to '_' (claude/sol.cpp -> claude_sol), so the two agents never collide in tmp/.
 # Each variant builds its own sim binary, so several may be scored concurrently.
 set -e
-SRC=${1:-sol.cpp}
+SRC=${1:-ref.cpp}
 GLOB=${2:-"tests/ex1.txt tests/ex2.txt tests/g_*.txt"}
-TAG=$(basename "$SRC" .cpp)
+TAG=$(echo "$SRC" | sed 's/\.cpp$//; s#[/\\]#_#g')
 BIN="tmp/sim_$TAG.exe"
 mkdir -p tmp
 g++ -O2 -std=gnu++17 -DSOL_SRC="\"$SRC\"" -o "$BIN" sim.cpp

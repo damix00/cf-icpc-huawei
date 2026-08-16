@@ -1,8 +1,9 @@
 #!/bin/sh
-# Build and score the strategy across the local suite.  ./run.sh
+# Build and score a strategy across tests/.   sh run.sh claude/sol.cpp
+# (score.sh is the general tool; this only exists for a quick default run.)
 set -e
-g++ -O2 -std=gnu++17 -o sim.exe sim.cpp
-g++ -O2 -std=gnu++17 -o sol.exe sol.cpp
+SRC=${1:-ref.cpp}
+g++ -O2 -std=gnu++17 -DSOL_SRC="\"$SRC\"" -o sim.exe sim.cpp
 for f in tests/ex1.txt tests/ex2.txt tests/g_*.txt; do
   [ -f "$f" ] || continue
   ./sim.exe "$f" || true

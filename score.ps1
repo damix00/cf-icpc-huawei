@@ -1,11 +1,11 @@
 # Score a strategy source across a test suite and print the mean (PowerShell port of score.sh).
-# Usage:  ./score.ps1 [sol.cpp] ["judge/*.txt"]
+# Usage:  ./score.ps1 [claude/sol.cpp] ["judge/*.txt"]
 param(
-    [string]$Src = "sol.cpp",
+    [string]$Src = "ref.cpp",
     [string]$Glob = "tests/ex1.txt tests/ex2.txt tests/g_*.txt"
 )
 $ErrorActionPreference = "Stop"
-$tag = [System.IO.Path]::GetFileNameWithoutExtension($Src)
+$tag = ($Src -replace '\.cpp$','') -replace '[/\\]','_'
 $bin = "tmp/sim_$tag.exe"
 New-Item -ItemType Directory -Force -Path "tmp" | Out-Null
 $def = '-DSOL_SRC=\"' + $Src + '\"'
