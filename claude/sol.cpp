@@ -129,9 +129,29 @@ struct Theta {
     bool sjf = true;
     int sjfProc = 1, sjfPost = 0;
 
+    // Cap the merge holds by the run's REMAINING total TPOT budget (0 = off, the shipped
+    // behaviour).  Only computable now that tp_base yields the exact token total.
+    double tpotCap = 0.0;
+
     // wave-shape override (0 = let the rate model choose).  The rate model is a compromise too:
     // a per-instance fixed (d, m) beats it by +3.54/test on judge/ (claude/tmp/wave_oracle.txt).
     int fixM = 0, fixD = 0, fixMR = 0;
+
+    // Field-by-field, not memcmp: padding bytes are unspecified and would make equal policies look
+    // different, which matters because a duplicate candidate costs a whole forward simulation.
+    bool operator==(const Theta& o) const {
+        return prefillUrgency == o.prefillUrgency && pieceMul == o.pieceMul && poolTarget == o.poolTarget
+            && strcmp(ordA, o.ordA) == 0 && strcmp(ordD, o.ordD) == 0 && ordW == o.ordW
+            && waitPost == o.waitPost && waitProc == o.waitProc && holdCap == o.holdCap
+            && eBottleW == o.eBottleW && holdPreToo == o.holdPreToo && remBusyW == o.remBusyW
+            && decW == o.decW && dTol == o.dTol && warmUp == o.warmUp
+            && linkFixedFrac == o.linkFixedFrac && jitPre == o.jitPre && jitProc == o.jitProc
+            && jitMode == o.jitMode && jitL == o.jitL && jitSlack == o.jitSlack
+            && tpotMargin == o.tpotMargin && tdrGuard == o.tdrGuard && arrExpect == o.arrExpect
+            && swapMin == o.swapMin && swapWarm == o.swapWarm && deferFirst == o.deferFirst
+            && deferSlo == o.deferSlo && sjf == o.sjf && sjfProc == o.sjfProc && sjfPost == o.sjfPost
+            && fixM == o.fixM && fixD == o.fixD && fixMR == o.fixMR && tpotCap == o.tpotCap;
+    }
 
     // Read the shipped defaults from the environment.  Only used to build the *default* theta;
     // the selector's candidates are constructed in code.
@@ -168,6 +188,7 @@ struct Theta {
         sjf = envD("CF_SJF", 1.0) > 0.5;
         sjfProc = (int)envD("CF_SJFP", sjfProc);
         sjfPost = (int)envD("CF_SJFO", sjfPost);
+        tpotCap = envD("CF_TPCAP", 0.0);
         fixM = (int)envD("CF_FIXM", 0);
         fixD = (int)envD("CF_FIXD", 0);
         fixMR = (int)envD("CF_FIXMR", 0);
@@ -287,6 +308,39 @@ struct Sched {
     inline void upIns(int i) { upstreamLin.insert(lin_[i]); }
     inline void upErase(int i) { auto it = upstreamLin.find(lin_[i]); if (it != upstreamLin.end()) upstreamLin.erase(it); }
     inline double tpotNow() const { return gapCnt ? spanSum / (double)gapCnt : 0.0; }
+
+    // The solved total output-token count, pushed in by the selector (0 = not yet known).
+    double totTok = 0;
+
+    // How many milliseconds of token gap the whole run can still afford before TPOT passes SLO2.
+    //
+    // The scorer's TPOT is sum_i(last_i - first_i) / sum_i(L_out_i - 1), and that denominator is
+    // exactly T - R: a request with L_out = 1 contributes zero to both the restricted and the full
+    // sum.  With T solved from tp_base and R observed, the denominator is KNOWN -- so the total gap
+    // the run may spend is SLO2*(T-R), of which spanSum is already gone.  That is a real budget in
+    // milliseconds, where tpotNow() is only a running average: biased high early when few gaps have
+    // been measured, and unable to say how much room is left.
+    //
+    // Note this is the opposite of the rule refuted in NOTES 17e.  That one shrank hold budgets
+    // wherever the measured TPOT *rate* was high -- the -104.0 mechanism applied selectively.  This
+    // one is slack-total: unconstrained early, when the budget is nearly all intact, and binding
+    // only as the run actually spends it.
+    inline double tpotSlackMs() const {
+        if (totTok <= 0 || P.SLO2 <= 0) return 1e300;
+        double D = totTok - (double)st.size();          // = sum(L_out - 1) over the whole run
+        if (D <= 0) return 1e300;
+        return max(0.0, P.SLO2 * D - spanSum);
+    }
+
+    // The slack turned into a per-hold ceiling: a hold of x ms delays the next token of every live
+    // request, so it costs roughly x per live request out of the shared budget.  Off (infinite)
+    // unless the selector picks a theta that switches it on, so the default schedule is untouched.
+    inline double tpotCapMs() const {
+        if (th.tpotCap <= 0) return 1e300;
+        double s = tpotSlackMs();
+        if (s >= 1e299) return 1e300;
+        return th.tpotCap * s / max(1.0, (double)activeDecode);
+    }
 
     vector<int> xfIds;   // scratch for the id list of the transfer being queued
     inline void pushXfer(bool up, double len, bool dec, int remote) {
@@ -746,6 +800,7 @@ struct Sched {
         if (inFlight && !qDPost.empty() && (int)qDPost.size() < mStar && batchingHelpsBottleneck(mStar)) {
             double t1 = min(nextDecAt(false, -1), nextDownAfterProc());
             double budget = waitBudget(th.waitPost) * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
+            budget = min(budget, tpotCapMs());
             if (holdPostSince < 0) holdPostSince = t;
             if (t1 - t <= budget && t - holdPostSince <= th.holdCap * budget) holdPost = true;
         }
@@ -865,6 +920,7 @@ struct Sched {
             if (doDecode && inFlight && (int)qDProc[j].size() < mStarR && batchingHelpsBottleneck(mStarR)) {
                 double t1 = min(nextDecAt(true, j), nextUpAfterPre(j));
                 double budget = th.waitProc * mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
+                budget = min(budget, tpotCapMs());
                 if (holdProcSince[j] < 0) holdProcSince[j] = t;
                 if (t1 - t <= budget && t - holdProcSince[j] <= th.holdCap * budget) doDecode = false;
                 else holdProcSince[j] = -1;
@@ -1257,7 +1313,7 @@ struct Belief {
 
     // scenario 0: no further arrivals.  scenario 1: they continue at the observed rate for as long
     // again as they have already been running.
-    static void project(const Sched& sc, int scenario, Future& fu) {
+    static void project(const Sched& sc, int scenario, Future& fu, unsigned seed = 0) {
         if (truth(fu)) return;
         int n = (int)sc.st.size();                 // requests seen so far
         double t = sc.curT;
@@ -1304,10 +1360,21 @@ struct Belief {
         double wsum = 0;
         static vector<double> w;
         w.assign(R, 0.0);
+        // seed != 0 perturbs the SHAPE of the split while the rescale below keeps the solved total
+        // exact.  MEASURED AND OFF BY DEFAULT (CF_SELNS=0): averaging candidates over sampled splits
+        // was meant to stop a single point estimate producing the losers, and instead cost judge/
+        // -4.6/test and created a -66.3 instance.  Perturbing the split blurs the ranking rather
+        // than robustifying it -- the split is not where the belief error that matters lives.
+        unsigned long long rs = (unsigned long long)seed * 0x9E3779B97F4A7C15ull + 12345ull;
+        auto rnd = [&]() {
+            rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+            return (double)((rs >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53);
+        };
         for (int i = 0; i < R; i++) {
             if (i < n && sc.finished[i]) continue;
             int k = (i < n) ? sc.tokCnt[i] : 0;
             w[i] = max(1.0, M - k);
+            if (seed) w[i] = max(0.05, w[i] * (0.25 + 1.5 * rnd()));
             wsum += w[i];
         }
         // Self-consistency floor: we have already emitted `tokensOut` tokens and every unfinished
@@ -1355,42 +1422,56 @@ struct Selector {
     long long nextTok = 4;
     long long nFrames = 0, nextFrame = 4;
     int rounds = 0;
-    bool arrSel = false;
+    bool arrSel = false, enoughSel = false;
+    int nSwitch = 0, maxSwitch = 99;
     bool on = true, dbg = false, predOnly = false;
     clock_t totalBudget = 0, runBudget = 0, spent = 0, wallCeiling = 0;
+    const Params* par = nullptr;
     int maxRounds = 6, keep = 6;
     // Picking the argmax of 40+ candidates on an estimate is optimistically biased, so a rival must
     // clear the incumbent by a margin -- and by a wider one while the token total is still only a
     // lower bound.  A tie always resolves to the shipped default, the one setting with a judge
     // measurement behind it.
     double margin = 1.0, shakyMargin = 15.0;
-    // Both sit mid-plateau across judge/, hold/ and val/ (CF_SELMA 4..12 byte-identical;
-    // CF_SELFZ 4..8 within 0.3), not on a spike -- root CLAUDE.md rule 4.
-    int freezeAfter = 5, baseAnchor = 1, minArr = 8;
+    // On plateaus, not spikes (root CLAUDE.md rule 4): CF_SELMA 4..12 was byte-identical before
+    // the first decision became decisive and CF_SELFZ 8 and 99 are within 0.004 of each other now.
+    int freezeAfter = 8, baseAnchor = 1, minArr = 8, nSplit = 0;
 
-    void build(const Theta& base, const Params& P) {
+    // Candidates are built around an ANCHOR, not around the shipped default, so successive rounds
+    // are coordinate descent over the product space rather than 40 independent single-knob probes.
+    // The per-instance oracle in claude/tmp/oracle.py only ever varied one knob at a time; the real
+    // optimum is a combination, and this is how it gets reached without a combinatorial sweep.
+    // cands[0] is always the shipped default -- it is the reference every deviation must beat.
+    void build(const Theta& anchor, const Params& P) {
+        const Theta& base = anchor;
         cands.clear(); names.clear();
-        auto add = [&](const char* nm, Theta th) { cands.push_back(th); names.push_back(nm); };
-        add("base", base);
+        // Slots 0 and 1 are reserved for the default and the applied policy and are never deduped;
+        // everything after them is dropped if it duplicates a candidate already listed.
+        auto add = [&](const char* nm, const Theta& th) {
+            for (size_t q = 0; q < cands.size(); q++) if (cands[q] == th) return;
+            cands.push_back(th); names.push_back(nm);
+        };
+        cands.push_back(baseTh);  names.push_back("base");
+        cands.push_back(anchor);  names.push_back("cur");
         // admission order on the local computer
-        for (const char* o : {"3102", "1320", "0132", "3012"}) {
+        for (const char* o : {"1302", "3102", "1320", "0132", "3012"}) {
             Theta th = base; snprintf(th.ordA, sizeof th.ordA, "%s", o); add(o, th);
         }
         // the P PRE just-in-time uplink hold: the mechanism worth +55 on the judge, but its gate
-        for (int v : {0, 1, 4, 1000}) { Theta th = base; th.jitL = v; add("jitl", th); }
-        { Theta th = base; th.jitPre = 0; add("jitp0", th); }
+        for (int v : {0, 1, 2, 4, 1000}) { Theta th = base; th.jitL = v; add("jitl", th); }
+        for (int v : {0, 1}) { Theta th = base; th.jitPre = v; add("jitp", th); }
         // the D POST merge-hold budget: a judge-measured gradient with two opposing tests on it
-        for (double v : {1.0, 2.0, 4.0, 8.0}) { Theta th = base; th.waitPost = v; add("wp", th); }
-        for (double v : {1.0, 4.0}) { Theta th = base; th.waitProc = v; add("wr", th); }
-        for (int v : {0, 3}) { Theta th = base; th.holdPreToo = v; add("hp", th); }
+        for (double v : {1.0, 2.0, 4.0, 8.0, 32.0}) { Theta th = base; th.waitPost = v; add("wp", th); }
+        for (double v : {1.0, 4.0, 14.0}) { Theta th = base; th.waitProc = v; add("wr", th); }
+        for (int v : {0, 1, 3}) { Theta th = base; th.holdPreToo = v; add("hp", th); }
         // first-token deferral
-        { Theta th = base; th.deferFirst = 2; add("defer2", th); }
+        for (int v : {0, 2}) { Theta th = base; th.deferFirst = v; add("defer", th); }
         // placement / spread
-        for (double v : {0.0, 0.2, 0.5}) { Theta th = base; th.dTol = v; add("dtol", th); }
-        { Theta th = base; th.decW = 0; add("decw0", th); }
-        { Theta th = base; th.tdrGuard = 0; add("tdrg0", th); }
-        { Theta th = base; th.poolTarget = 4; add("pool4", th); }
-        for (double v : {1.0, 4.0}) { Theta th = base; th.pieceMul = v; add("piece", th); }
+        for (double v : {0.0, 0.04, 0.2, 0.5}) { Theta th = base; th.dTol = v; add("dtol", th); }
+        for (double v : {0.0, 1.0}) { Theta th = base; th.decW = v; add("decw", th); }
+        for (double v : {0.0, 0.5}) { Theta th = base; th.tdrGuard = v; add("tdrg", th); }
+        for (int v : {4, 1 << 30}) { Theta th = base; th.poolTarget = v; add("pool", th); }
+        for (double v : {1.0, 4.0, 128.0}) { Theta th = base; th.pieceMul = v; add("piece", th); }
         // fixed wave shape: the rate model is itself a compromise, and a per-instance (d, m) beats
         // it by +3.54/test on judge/ (claude/tmp/wave_oracle.txt)
         for (int d : {1, 2, 4, 8}) {
@@ -1399,30 +1480,40 @@ struct Selector {
                 Theta th = base; th.fixD = d; th.fixM = m; add("dm", th);
             }
         }
+        { Theta th = base; th.fixD = 0; th.fixM = 0; add("dmoff", th); }
+        // the global TPOT budget cap -- speculative, and safe precisely because it is a candidate:
+        // an instance only runs it if the exact simulator says it is better there
+        for (double v : {0.0, 0.5, 1.0, 2.0}) { Theta th = base; th.tpotCap = v; add("tpcap", th); }
     }
+
+    Theta baseTh, curTh;
 
     void init(const Theta& base, const Params& P) {
         on = envD("CF_SEL", 1.0) > 0.5;
         dbg = envD("CF_SELDBG", 0.0) > 0.5;
         predOnly = envD("CF_SELPRED", 0.0) > 0.5;
-        maxRounds = (int)envD("CF_SELR", 6);
+        maxRounds = (int)envD("CF_SELR", 8);
         keep = (int)envD("CF_SELK", 6);
         margin = envD("CF_SELM", 1.0);
         shakyMargin = envD("CF_SELSM", 15.0);
-        freezeAfter = (int)envD("CF_SELFZ", 5);
+        freezeAfter = (int)envD("CF_SELFZ", 8);
         baseAnchor = (int)envD("CF_SELBA", 1);
         minArr = (int)envD("CF_SELMA", 8);
+        nSplit = (int)envD("CF_SELNS", 0);
         nextTok = (long long)envD("CF_SELT", 4);
         double budgetSec = envD("CF_SELB", 4.0);
         totalBudget = (clock_t)(budgetSec * CLOCKS_PER_SEC);
         wallCeiling = (clock_t)(envD("CF_SELWC", 9.0) * CLOCKS_PER_SEC);
         chosen = 0;
         rounds = 0;
-        arrSel = false;
+        arrSel = false; enoughSel = false; nSwitch = 0;
+        maxSwitch = (int)envD("CF_SELMS", 99);
         nFrames = 0;
         nextFrame = (long long)envD("CF_SELF", 4);
         spent = 0;
-        build(base, P);
+        baseTh = base; curTh = base;
+        par = &P;
+        build(curTh, P);
         // No single candidate may eat the whole allowance: on a 24-million-millisecond instance one
         // forward run costs seconds, and a round that spends its entire budget on the first few
         // candidates is choosing from an arbitrary subset.
@@ -1441,8 +1532,14 @@ struct Selector {
         // candidates disagree about (admission order, the P PRE hold, the wave shape) is decided
         // during ramp-up: a selection made after the ramp has run can no longer buy it.
         bool arrOver = Belief::arrivalsLikelyOver(sc);
+        bool enough = arrOver || (int)sc.st.size() >= minArr;
         bool trig = false;
         if (arrOver && !arrSel) { arrSel = true; trig = true; }
+        // Fire the instant the belief first becomes good enough to act on, rather than waiting for
+        // the next frame or token milestone.  Measured: the remaining gap to the per-instance oracle
+        // is almost entirely the cost of running under the default before the switch lands, so the
+        // earliest admissible decision is worth more than any later refinement.
+        if (enough && !enoughSel) { enoughSel = true; trig = true; }
         if (sc.tokensOut >= nextTok) { nextTok *= 4; trig = true; }
         // A token-count trigger alone is useless on a prefill-bound instance: h_4_15 emits its
         // fourth token at t=135910 of a 141200 ms run, by which time every placement decision the
@@ -1456,7 +1553,23 @@ struct Selector {
         if (clock() > wallCeiling) return;
 
         clock_t start = clock();
-        clock_t hardStop = start + min(totalBudget - spent, (clock_t)(4 * runBudget) + runBudget * (clock_t)cands.size());
+        // Publish the solved token total to the live policy.  Exact once arrivals are done; while
+        // they are still coming it is a lower bound, and every gate that reads it treats it as one.
+        {
+            static Future tf;
+            Belief::project(sc, 0, tf);
+            double tot = 0;
+            for (int v : tf.Lout) tot += v;
+            sc.totTok = tot;
+        }
+        // Coordinate-descent step: re-centre the candidate set on the policy currently applied.
+        build(curTh, *par);
+        // Share what is left of the allowance across this round's candidates, so a round late in
+        // the run is not starved by an early one and no single forward run can eat the budget.
+        clock_t remain = totalBudget - spent;
+        clock_t hardStop = start + remain;
+        runBudget = max((clock_t)(0.005 * CLOCKS_PER_SEC),
+                        (clock_t)(remain / (2 * (clock_t)max<size_t>(1, cands.size()))));
 
         static Engine eng;
         static Future fu;
@@ -1472,7 +1585,7 @@ struct Selector {
         if (predOnly) {
             Belief::project(sc, 0, fu);
             Sched clone = sc;
-            clone.setTheta(cands[chosen]);
+            clone.setTheta(curTh);
             eng.seed(sc, fu);
             Pred p = eng.run(std::move(clone), start + runBudget);
             fprintf(stderr, "[pred] tok=%lld T=%d pred=%.3f tp=%.6g tdr=%.4g tpot=%.4g ok=%d\n",
@@ -1507,23 +1620,40 @@ struct Selector {
 
         int best = sc1[0].second;
         double bestScore = sc1[0].first;
-        // round 2: re-price the survivors under the second arrival scenario and take the mean, so a
-        // policy that only wins if arrivals stop does not get picked on that assumption alone.
-        if (secondary >= 0 && (int)sc1.size() > 1) {
-            Belief::project(sc, secondary, fu);
+        // Round 2 re-prices the survivors over the OTHER futures that are consistent with what we
+        // have observed -- the second arrival scenario, and several sampled splits of the (exactly
+        // known) token total -- and ranks them on the mean.  A policy that only wins under one
+        // particular guess about the future does not get picked on that guess alone.
+        double meanBase = -1, meanCur = -1;
+        vector<pair<int, unsigned>> alts;                       // (scenario, split seed)
+        if (secondary >= 0) alts.push_back({secondary, 0});
+        for (int s = 1; s <= nSplit; s++) alts.push_back({primary, (unsigned)s});
+        if (!alts.empty() && (int)sc1.size() > 1) {
+            int lim = min((int)sc1.size(), keep);
+            vector<double> acc(lim), cnt(lim, 1.0);
+            for (int r = 0; r < lim; r++) acc[r] = sc1[r].first;
+            for (auto& a : alts) {
+                if (clock() >= hardStop) break;
+                Belief::project(sc, a.first, fu, a.second);
+                for (int r = 0; r < lim; r++) {
+                    if (clock() >= hardStop) break;
+                    clock_t dl = min(hardStop, clock() + runBudget);
+                    Sched clone = sc;
+                    clone.setTheta(cands[sc1[r].second]);
+                    eng.seed(sc, fu);
+                    Pred p = eng.run(std::move(clone), dl);
+                    if (p.ok) { acc[r] += p.score; cnt[r] += 1.0; }
+                }
+            }
             double bestMean = -1;
             int bestIdx = -1;
-            int lim = min((int)sc1.size(), keep);
             for (int r = 0; r < lim; r++) {
-                if (clock() >= hardStop) break;
-                int c = sc1[r].second;
-                clock_t dl = min(hardStop, clock() + runBudget);
-                Sched clone = sc;
-                clone.setTheta(cands[c]);
-                eng.seed(sc, fu);
-                Pred p = eng.run(std::move(clone), dl);
-                double mean = p.ok ? 0.5 * (sc1[r].first + p.score) : sc1[r].first;
-                if (mean > bestMean + 1e-12) { bestMean = mean; bestIdx = c; }
+                double mean = acc[r] / cnt[r];
+                // the reference scores must be means too, or a mean is compared against a
+                // single-future estimate and the margin stops meaning anything
+                if (sc1[r].second == 0) meanBase = mean;
+                if (sc1[r].second == 1) meanCur = mean;
+                if (mean > bestMean + 1e-12) { bestMean = mean; bestIdx = sc1[r].second; }
             }
             if (bestIdx >= 0) { best = bestIdx; bestScore = bestMean; }
         }
@@ -1534,9 +1664,11 @@ struct Selector {
         // belief simply persists (h_7_12 lost 10.1 exactly that way).
         double incumbent = -1, baseScore = -1;
         for (auto& pr : sc1) {
-            if (pr.second == chosen) incumbent = pr.first;
+            if (pr.second == 1) incumbent = pr.first;    // cands[1] is always the applied policy
             if (pr.second == 0) baseScore = pr.first;
         }
+        if (meanCur >= 0) incumbent = meanCur;
+        if (meanBase >= 0) baseScore = meanBase;
         // Switching is only allowed while the choice is still cheap to make.  A policy evaluated
         // "from here on" can genuinely be the better continuation and still produce a WORSE run
         // than either pure policy, because the schedule it inherits was built by the other one:
@@ -1546,13 +1678,18 @@ struct Selector {
         // arrivals, so with two of them in hand the simulated instance is a stub and its ranking is
         // meaningless -- j_47 ran `jitp0` through its whole admission window on exactly that.
         // Either arrivals are done (the total is then exact) or enough of them are in.
-        bool enoughSeen = arrOver || (int)sc.st.size() >= minArr;
-        if (rounds < freezeAfter && enoughSeen) {
+        // Each switch splices a new policy onto a schedule the previous one built, and the hybrid
+        // can be worse than either.  Cap how many times that may happen.
+        if (rounds < freezeAfter && enough && nSwitch < maxSwitch) {
+            // A deviation must out-predict the shipped default by the margin, every round.
             int want = baseAnchor ? ((bestScore > baseScore + needMargin) ? best : 0) : best;
-            if (want != chosen && (want == 0 ? baseScore > incumbent - 1e-9
-                                             : bestScore > incumbent + needMargin)) {
+            bool change = (want == 0) ? (baseScore > incumbent + 1e-9)
+                                      : (bestScore > incumbent + needMargin);
+            if (change) {
                 chosen = want;
-                sc.setTheta(cands[chosen]);
+                curTh = cands[want];
+                sc.setTheta(curTh);
+                nSwitch++;
             }
         }
         rounds++;

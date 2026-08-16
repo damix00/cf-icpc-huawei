@@ -86,7 +86,21 @@ struct Theta {
     double deferSlo = 1.0;
     bool sjf = true;
     int sjfProc = 1, sjfPost = 0;
+    double tpotCap = 0.0;
     int fixM = 0, fixD = 0, fixMR = 0;
+    bool operator==(const Theta& o) const {
+        return prefillUrgency == o.prefillUrgency && pieceMul == o.pieceMul && poolTarget == o.poolTarget
+            && strcmp(ordA, o.ordA) == 0 && strcmp(ordD, o.ordD) == 0 && ordW == o.ordW
+            && waitPost == o.waitPost && waitProc == o.waitProc && holdCap == o.holdCap
+            && eBottleW == o.eBottleW && holdPreToo == o.holdPreToo && remBusyW == o.remBusyW
+            && decW == o.decW && dTol == o.dTol && warmUp == o.warmUp
+            && linkFixedFrac == o.linkFixedFrac && jitPre == o.jitPre && jitProc == o.jitProc
+            && jitMode == o.jitMode && jitL == o.jitL && jitSlack == o.jitSlack
+            && tpotMargin == o.tpotMargin && tdrGuard == o.tdrGuard && arrExpect == o.arrExpect
+            && swapMin == o.swapMin && swapWarm == o.swapWarm && deferFirst == o.deferFirst
+            && deferSlo == o.deferSlo && sjf == o.sjf && sjfProc == o.sjfProc && sjfPost == o.sjfPost
+            && fixM == o.fixM && fixD == o.fixD && fixMR == o.fixMR && tpotCap == o.tpotCap;
+    }
     void fromEnv() {
         prefillUrgency = envD("CF_URG", prefillUrgency);
         pieceMul = envD("CF_PIECE", pieceMul);
@@ -120,6 +134,7 @@ struct Theta {
         sjf = envD("CF_SJF", 1.0) > 0.5;
         sjfProc = (int)envD("CF_SJFP", sjfProc);
         sjfPost = (int)envD("CF_SJFO", sjfPost);
+        tpotCap = envD("CF_TPCAP", 0.0);
         fixM = (int)envD("CF_FIXM", 0);
         fixD = (int)envD("CF_FIXD", 0);
         fixMR = (int)envD("CF_FIXMR", 0);
@@ -196,6 +211,19 @@ struct Sched {
     inline void upIns(int i) { upstreamLin.insert(lin_[i]); }
     inline void upErase(int i) { auto it = upstreamLin.find(lin_[i]); if (it != upstreamLin.end()) upstreamLin.erase(it); }
     inline double tpotNow() const { return gapCnt ? spanSum / (double)gapCnt : 0.0; }
+    double totTok = 0;
+    inline double tpotSlackMs() const {
+        if (totTok <= 0 || P.SLO2 <= 0) return 1e300;
+        double D = totTok - (double)st.size();
+        if (D <= 0) return 1e300;
+        return max(0.0, P.SLO2 * D - spanSum);
+    }
+    inline double tpotCapMs() const {
+        if (th.tpotCap <= 0) return 1e300;
+        double s = tpotSlackMs();
+        if (s >= 1e299) return 1e300;
+        return th.tpotCap * s / max(1.0, (double)activeDecode);
+    }
     vector<int> xfIds;
     inline void pushXfer(bool up, double len, bool dec, int remote) {
         double& freeAt = up ? upFreeAt : downFreeAt;
@@ -570,6 +598,7 @@ struct Sched {
         if (inFlight && !qDPost.empty() && (int)qDPost.size() < mStar && batchingHelpsBottleneck(mStar)) {
             double t1 = min(nextDecAt(false, -1), nextDownAfterProc());
             double budget = waitBudget(th.waitPost) * mergeSaving(T.c[C_DPOST], (double)qDPost.size(), P.S);
+            budget = min(budget, tpotCapMs());
             if (holdPostSince < 0) holdPostSince = t;
             if (t1 - t <= budget && t - holdPostSince <= th.holdCap * budget) holdPost = true;
         }
@@ -672,6 +701,7 @@ struct Sched {
             if (doDecode && inFlight && (int)qDProc[j].size() < mStarR && batchingHelpsBottleneck(mStarR)) {
                 double t1 = min(nextDecAt(true, j), nextUpAfterPre(j));
                 double budget = th.waitProc * mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
+                budget = min(budget, tpotCapMs());
                 if (holdProcSince[j] < 0) holdProcSince[j] = t;
                 if (t1 - t <= budget && t - holdProcSince[j] <= th.holdCap * budget) doDecode = false;
                 else holdProcSince[j] = -1;
@@ -993,7 +1023,7 @@ struct Belief {
         fu = cache;
         return true;
     }
-    static void project(const Sched& sc, int scenario, Future& fu) {
+    static void project(const Sched& sc, int scenario, Future& fu, unsigned seed = 0) {
         if (truth(fu)) return;
         int n = (int)sc.st.size();
         double t = sc.curT;
@@ -1031,10 +1061,16 @@ struct Belief {
         double wsum = 0;
         static vector<double> w;
         w.assign(R, 0.0);
+        unsigned long long rs = (unsigned long long)seed * 0x9E3779B97F4A7C15ull + 12345ull;
+        auto rnd = [&]() {
+            rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+            return (double)((rs >> 11) & ((1ull << 53) - 1)) / (double)(1ull << 53);
+        };
         for (int i = 0; i < R; i++) {
             if (i < n && sc.finished[i]) continue;
             int k = (i < n) ? sc.tokCnt[i] : 0;
             w[i] = max(1.0, M - k);
+            if (seed) w[i] = max(0.05, w[i] * (0.25 + 1.5 * rnd()));
             wsum += w[i];
         }
         long long owed = 0;
@@ -1064,59 +1100,73 @@ struct Selector {
     long long nextTok = 4;
     long long nFrames = 0, nextFrame = 4;
     int rounds = 0;
-    bool arrSel = false;
+    bool arrSel = false, enoughSel = false;
+    int nSwitch = 0, maxSwitch = 99;
     bool on = true, dbg = false, predOnly = false;
     clock_t totalBudget = 0, runBudget = 0, spent = 0, wallCeiling = 0;
+    const Params* par = nullptr;
     int maxRounds = 6, keep = 6;
     double margin = 1.0, shakyMargin = 15.0;
-    int freezeAfter = 5, baseAnchor = 1, minArr = 8;
-    void build(const Theta& base, const Params& P) {
+    int freezeAfter = 8, baseAnchor = 1, minArr = 8, nSplit = 0;
+    void build(const Theta& anchor, const Params& P) {
+        const Theta& base = anchor;
         cands.clear(); names.clear();
-        auto add = [&](const char* nm, Theta th) { cands.push_back(th); names.push_back(nm); };
-        add("base", base);
-        for (const char* o : {"3102", "1320", "0132", "3012"}) {
+        auto add = [&](const char* nm, const Theta& th) {
+            for (size_t q = 0; q < cands.size(); q++) if (cands[q] == th) return;
+            cands.push_back(th); names.push_back(nm);
+        };
+        cands.push_back(baseTh);  names.push_back("base");
+        cands.push_back(anchor);  names.push_back("cur");
+        for (const char* o : {"1302", "3102", "1320", "0132", "3012"}) {
             Theta th = base; snprintf(th.ordA, sizeof th.ordA, "%s", o); add(o, th);
         }
-        for (int v : {0, 1, 4, 1000}) { Theta th = base; th.jitL = v; add("jitl", th); }
-        { Theta th = base; th.jitPre = 0; add("jitp0", th); }
-        for (double v : {1.0, 2.0, 4.0, 8.0}) { Theta th = base; th.waitPost = v; add("wp", th); }
-        for (double v : {1.0, 4.0}) { Theta th = base; th.waitProc = v; add("wr", th); }
-        for (int v : {0, 3}) { Theta th = base; th.holdPreToo = v; add("hp", th); }
-        { Theta th = base; th.deferFirst = 2; add("defer2", th); }
-        for (double v : {0.0, 0.2, 0.5}) { Theta th = base; th.dTol = v; add("dtol", th); }
-        { Theta th = base; th.decW = 0; add("decw0", th); }
-        { Theta th = base; th.tdrGuard = 0; add("tdrg0", th); }
-        { Theta th = base; th.poolTarget = 4; add("pool4", th); }
-        for (double v : {1.0, 4.0}) { Theta th = base; th.pieceMul = v; add("piece", th); }
+        for (int v : {0, 1, 2, 4, 1000}) { Theta th = base; th.jitL = v; add("jitl", th); }
+        for (int v : {0, 1}) { Theta th = base; th.jitPre = v; add("jitp", th); }
+        for (double v : {1.0, 2.0, 4.0, 8.0, 32.0}) { Theta th = base; th.waitPost = v; add("wp", th); }
+        for (double v : {1.0, 4.0, 14.0}) { Theta th = base; th.waitProc = v; add("wr", th); }
+        for (int v : {0, 1, 3}) { Theta th = base; th.holdPreToo = v; add("hp", th); }
+        for (int v : {0, 2}) { Theta th = base; th.deferFirst = v; add("defer", th); }
+        for (double v : {0.0, 0.04, 0.2, 0.5}) { Theta th = base; th.dTol = v; add("dtol", th); }
+        for (double v : {0.0, 1.0}) { Theta th = base; th.decW = v; add("decw", th); }
+        for (double v : {0.0, 0.5}) { Theta th = base; th.tdrGuard = v; add("tdrg", th); }
+        for (int v : {4, 1 << 30}) { Theta th = base; th.poolTarget = v; add("pool", th); }
+        for (double v : {1.0, 4.0, 128.0}) { Theta th = base; th.pieceMul = v; add("piece", th); }
         for (int d : {1, 2, 4, 8}) {
             if (d > P.K) break;
             for (int m : {1, 2, 4, 8, 16}) {
                 Theta th = base; th.fixD = d; th.fixM = m; add("dm", th);
             }
         }
+        { Theta th = base; th.fixD = 0; th.fixM = 0; add("dmoff", th); }
+        for (double v : {0.0, 0.5, 1.0, 2.0}) { Theta th = base; th.tpotCap = v; add("tpcap", th); }
     }
+    Theta baseTh, curTh;
     void init(const Theta& base, const Params& P) {
         on = envD("CF_SEL", 1.0) > 0.5;
         dbg = envD("CF_SELDBG", 0.0) > 0.5;
         predOnly = envD("CF_SELPRED", 0.0) > 0.5;
-        maxRounds = (int)envD("CF_SELR", 6);
+        maxRounds = (int)envD("CF_SELR", 8);
         keep = (int)envD("CF_SELK", 6);
         margin = envD("CF_SELM", 1.0);
         shakyMargin = envD("CF_SELSM", 15.0);
-        freezeAfter = (int)envD("CF_SELFZ", 5);
+        freezeAfter = (int)envD("CF_SELFZ", 8);
         baseAnchor = (int)envD("CF_SELBA", 1);
         minArr = (int)envD("CF_SELMA", 8);
+        nSplit = (int)envD("CF_SELNS", 0);
         nextTok = (long long)envD("CF_SELT", 4);
         double budgetSec = envD("CF_SELB", 4.0);
         totalBudget = (clock_t)(budgetSec * CLOCKS_PER_SEC);
         wallCeiling = (clock_t)(envD("CF_SELWC", 9.0) * CLOCKS_PER_SEC);
         chosen = 0;
         rounds = 0;
-        arrSel = false;
+        arrSel = false; enoughSel = false; nSwitch = 0;
+        maxSwitch = (int)envD("CF_SELMS", 99);
         nFrames = 0;
         nextFrame = (long long)envD("CF_SELF", 4);
         spent = 0;
-        build(base, P);
+        baseTh = base; curTh = base;
+        par = &P;
+        build(curTh, P);
         double runSec = envD("CF_SELRB", 0.0);
         runBudget = runSec > 0 ? (clock_t)(runSec * CLOCKS_PER_SEC)
                                : max((clock_t)(0.01 * CLOCKS_PER_SEC),
@@ -1126,15 +1176,28 @@ struct Selector {
         if (!on || rounds >= maxRounds || cands.size() < 2) return;
         if (sc.st.empty()) return;
         bool arrOver = Belief::arrivalsLikelyOver(sc);
+        bool enough = arrOver || (int)sc.st.size() >= minArr;
         bool trig = false;
         if (arrOver && !arrSel) { arrSel = true; trig = true; }
+        if (enough && !enoughSel) { enoughSel = true; trig = true; }
         if (sc.tokensOut >= nextTok) { nextTok *= 4; trig = true; }
         if (++nFrames >= nextFrame) { nextFrame *= 16; trig = true; }
         if (!trig) return;
         if (spent >= totalBudget) return;
         if (clock() > wallCeiling) return;
         clock_t start = clock();
-        clock_t hardStop = start + min(totalBudget - spent, (clock_t)(4 * runBudget) + runBudget * (clock_t)cands.size());
+        {
+            static Future tf;
+            Belief::project(sc, 0, tf);
+            double tot = 0;
+            for (int v : tf.Lout) tot += v;
+            sc.totTok = tot;
+        }
+        build(curTh, *par);
+        clock_t remain = totalBudget - spent;
+        clock_t hardStop = start + remain;
+        runBudget = max((clock_t)(0.005 * CLOCKS_PER_SEC),
+                        (clock_t)(remain / (2 * (clock_t)max<size_t>(1, cands.size()))));
         static Engine eng;
         static Future fu;
         int primary = arrOver ? 0 : 1;
@@ -1143,7 +1206,7 @@ struct Selector {
         if (predOnly) {
             Belief::project(sc, 0, fu);
             Sched clone = sc;
-            clone.setTheta(cands[chosen]);
+            clone.setTheta(curTh);
             eng.seed(sc, fu);
             Pred p = eng.run(std::move(clone), start + runBudget);
             fprintf(stderr, "[pred] tok=%lld T=%d pred=%.3f tp=%.6g tdr=%.4g tpot=%.4g ok=%d\n",
@@ -1172,36 +1235,53 @@ struct Selector {
         });
         int best = sc1[0].second;
         double bestScore = sc1[0].first;
-        if (secondary >= 0 && (int)sc1.size() > 1) {
-            Belief::project(sc, secondary, fu);
+        double meanBase = -1, meanCur = -1;
+        vector<pair<int, unsigned>> alts;
+        if (secondary >= 0) alts.push_back({secondary, 0});
+        for (int s = 1; s <= nSplit; s++) alts.push_back({primary, (unsigned)s});
+        if (!alts.empty() && (int)sc1.size() > 1) {
+            int lim = min((int)sc1.size(), keep);
+            vector<double> acc(lim), cnt(lim, 1.0);
+            for (int r = 0; r < lim; r++) acc[r] = sc1[r].first;
+            for (auto& a : alts) {
+                if (clock() >= hardStop) break;
+                Belief::project(sc, a.first, fu, a.second);
+                for (int r = 0; r < lim; r++) {
+                    if (clock() >= hardStop) break;
+                    clock_t dl = min(hardStop, clock() + runBudget);
+                    Sched clone = sc;
+                    clone.setTheta(cands[sc1[r].second]);
+                    eng.seed(sc, fu);
+                    Pred p = eng.run(std::move(clone), dl);
+                    if (p.ok) { acc[r] += p.score; cnt[r] += 1.0; }
+                }
+            }
             double bestMean = -1;
             int bestIdx = -1;
-            int lim = min((int)sc1.size(), keep);
             for (int r = 0; r < lim; r++) {
-                if (clock() >= hardStop) break;
-                int c = sc1[r].second;
-                clock_t dl = min(hardStop, clock() + runBudget);
-                Sched clone = sc;
-                clone.setTheta(cands[c]);
-                eng.seed(sc, fu);
-                Pred p = eng.run(std::move(clone), dl);
-                double mean = p.ok ? 0.5 * (sc1[r].first + p.score) : sc1[r].first;
-                if (mean > bestMean + 1e-12) { bestMean = mean; bestIdx = c; }
+                double mean = acc[r] / cnt[r];
+                if (sc1[r].second == 0) meanBase = mean;
+                if (sc1[r].second == 1) meanCur = mean;
+                if (mean > bestMean + 1e-12) { bestMean = mean; bestIdx = sc1[r].second; }
             }
             if (bestIdx >= 0) { best = bestIdx; bestScore = bestMean; }
         }
         double incumbent = -1, baseScore = -1;
         for (auto& pr : sc1) {
-            if (pr.second == chosen) incumbent = pr.first;
+            if (pr.second == 1) incumbent = pr.first;
             if (pr.second == 0) baseScore = pr.first;
         }
-        bool enoughSeen = arrOver || (int)sc.st.size() >= minArr;
-        if (rounds < freezeAfter && enoughSeen) {
+        if (meanCur >= 0) incumbent = meanCur;
+        if (meanBase >= 0) baseScore = meanBase;
+        if (rounds < freezeAfter && enough && nSwitch < maxSwitch) {
             int want = baseAnchor ? ((bestScore > baseScore + needMargin) ? best : 0) : best;
-            if (want != chosen && (want == 0 ? baseScore > incumbent - 1e-9
-                                             : bestScore > incumbent + needMargin)) {
+            bool change = (want == 0) ? (baseScore > incumbent + 1e-9)
+                                      : (bestScore > incumbent + needMargin);
+            if (change) {
                 chosen = want;
-                sc.setTheta(cands[chosen]);
+                curTh = cands[want];
+                sc.setTheta(curTh);
+                nSwitch++;
             }
         }
         rounds++;

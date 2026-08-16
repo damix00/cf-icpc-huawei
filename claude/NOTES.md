@@ -1399,17 +1399,19 @@ from the deferral, -14.6 from `mStar = L`); #6 has `w_tp >= 0.75`, is the odd on
 gate, and NOTES 19 argued it was near its instance ceiling. They want opposite things, and a
 per-instance choice is the only thing that can give both. #14 still has not moved (32 submissions).
 
-**The ratio is the real news.** `judge/` predicted +7.19/test, the judge delivered +6.22/22 tests --
-about **1.15x**, against the 10x over-prediction and two sign errors that made every local
-instrument untrustworthy in sections 16-20. The reason is structural: those measurements were
-global-knob changes whose `judge/` mean was carried by a handful of hyper-volatile instances the
-real 22 do not contain, whereas SimSelect's gain is spread over 17 of 40 instances with the worst
-loss at -4.1. **Local improvements to this architecture should be expected to transfer near 1:1**,
-which is a measurement loop the repo has never had.
+**The over-prediction is UNCHANGED -- do not misread this result.** `judge/` moved +7.186 *per
+test*; the real judge moved +6.216 *in total over 22 tests*, i.e. **+0.283 per test**. That is a
+**25x over-prediction**, in line with (slightly worse than) the 10x recorded in section 16. The new
+architecture did not fix the instrument. What it did change is the *shape* of the movement: the gain
+is spread over 17 of 40 local instances with a worst loss of -4.1, and on the real judge six tests
+moved rather than one. Keep applying rule 1: a local mean is a direction finder, never a magnitude.
 
 Time 4125 ms on test #17 against the 15 s limit -- the selector budget is being spent, with ~3.6x
 headroom left.
 
-Remaining losses are #13 (-7.98) and #8 (-2.66): instances where the selector switched and the
-prediction was wrong. Capture is ~55 % of the per-instance oracle, so the headroom inside this
-architecture is roughly another +5/test on `judge/`.
+**Where the next points are.** The wins on this submission total +16.97 and the losses -10.64, so
+**#13 (-7.98) and #8 (-2.66) are worth more than any further local mean**: they are instances where
+the selector switched and the prediction was wrong. That is a belief error, not a mechanism error --
+with `CF_TRUTH` the selector has zero losers on every suite. The total token count is now solved
+exactly; what remains uncertain is the per-request *split* of it, so the next step is to average each
+candidate over several sampled splits instead of ranking on one point estimate.
