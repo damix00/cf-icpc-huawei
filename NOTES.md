@@ -962,3 +962,26 @@ buy is a map of which of the 22 tests respond to what:
 So the axis has two opposing tests and the current setting sits between them. Uniform batching
 cannot win: #19 and #7 want opposite things. The only way to have both is a rule that reads the
 *per-instance* TPOT slack, which is what `sol_tb.cpp` (`CF_TPOTB`) does.
+
+### 17e. The TPOT-slack budget is refuted before submission, by the judge data we already have
+
+`sol_tb.cpp` replaces the fitted merge-hold budget with the measured TPOT slack
+(`max(one merge saving, CF_TPOTB * (SLO2 - tpotNow()))`). It behaves exactly as designed on the
+local proxies -- **+0.0 on every delay-sensitive test** (`j_34`, `j_36`, `j_40`, which `mStar = L`
+cost 17.6 / 19.5 / 1.7) and **+16.5 / +4.2 / +1.1** on the budget-sensitive ones (`j_45`, `j_33`,
+`j_53`). Right shape.
+
+It still collapses `hold/` from **841.1 to 824.2**, and bounding it above (`min` with the existing
+budget, so the slack can only ever tighten a hold) does not help -- 824.2 either way. So the damage
+comes from the *shrinking* half: wherever the measured TPOT is high, the rule cuts the budget
+towards the break-even.
+
+**That is the same change as `CF_WAIT_P = 1`, applied selectively -- and that change is the one that
+cost -104.0.** Worse, the half it was built for does not even apply: test #7 is indifferent to the
+budget (907.5 at `waitPost` 1, 8 and 16 alike) and lost its 14.6 to `mStar`, not to the hold length.
+The rule therefore pays the -104 mechanism to fix something it cannot reach.
+
+**Not submitted.** The coherent reading of all five judge probes is simply: *keep the merge-hold
+budget large, and leave `mStar` where the rate model puts it.* That is exactly `sol.cpp` at
+16077.404. The only untried step in the direction the judge has actually rewarded is more budget:
+`sol_p32.cpp` (`waitPost` 32) and beyond.

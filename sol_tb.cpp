@@ -797,8 +797,12 @@ void schedFrame(double t, const Frame& f, Response& out) {
         // hold where SLO2 is loose (#19 pays 4.9 for that) and SHRINKS it to the break-even where
         // TPOT is tight (#7 loses 14.6 whenever a ready token is delayed).  One merge saving is the
         // floor because that is the point at which the merge stops paying for its own wait.
+        // ... but never MORE than the merge-based budget the judge has already validated at 16:
+        // where SLO2 is loose the raw slack is thousands of ms, and an unbounded hold wrecks
+        // hold/ (841.1 -> 823.4).  So the slack only ever tightens the hold, never lengthens it
+        // past what is already known to score.
         if (tpotBudget > 0 && P.SLO2 > 0 && gapCnt > 0)
-            budget = max(ms1, tpotBudget * max(0.0, P.SLO2 - tpotNow()));
+            budget = min(budget, max(ms1, tpotBudget * max(0.0, P.SLO2 - tpotNow())));
         if (holdPostSince < 0) holdPostSince = t;
         if (t1 - t <= budget && t - holdPostSince <= holdCap * budget) holdPost = true;
     }
@@ -922,7 +926,7 @@ void schedFrame(double t, const Frame& f, Response& out) {
             double ms2 = mergeSaving(T.c[C_DPROC], (double)qDProc[j].size(), P.S);
             double budget = waitProc * ms2;
             if (tpotBudget > 0 && P.SLO2 > 0 && gapCnt > 0)
-                budget = max(ms2, tpotBudget * max(0.0, P.SLO2 - tpotNow()));
+                budget = min(budget, max(ms2, tpotBudget * max(0.0, P.SLO2 - tpotNow())));
             if (holdProcSince[j] < 0) holdProcSince[j] = t;
             if (t1 - t <= budget && t - holdProcSince[j] <= holdCap * budget) doDecode = false;
             else holdProcSince[j] = -1;
