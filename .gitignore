@@ -1,3 +1,4 @@
 tmp/
+.worktrees/
 *.exe
 *.myout
